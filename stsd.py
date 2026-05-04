@@ -39,7 +39,7 @@ except ImportError:
 
 
 # ============= CLOUD-SAFE PATH CONFIGURATION =============
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 APP_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 TEMP_DIR = Path(tempfile.gettempdir())
 
@@ -71,9 +71,9 @@ def build_yt_dlp_command(
         "-o", output_template,
     ]
     
-    # السطر السحري: إذا وجد ملف الكوكيز في السيرفر سيستخدمه فوراً
-    if os.path.exists(app_path("cookies.txt")):
-        cmd.extend(["--cookies", app_path("cookies.txt")])
+    cookies_path = app_path("cookies.txt")
+    if os.path.exists(cookies_path):
+        cmd.extend(["--cookies", cookies_path])
     
     if section_spec:
         cmd.extend(["--download-sections", section_spec, "--force-keyframes-at-cuts"])
@@ -401,25 +401,29 @@ def extract_video_id(url_or_id: str) -> Optional[str]:
 @st.cache_data
 def fetch_transcript(video_id: str, languages: Optional[List[str]] = None) -> Optional[List[Dict]]:
     """
-    Fetch transcript from YouTube with intelligent fallback.
-    
-    Priority:
-    1. YouTube captions API (fastest)
-    2. Whisper transcription (if available)
-    3. Return None (user will be informed)
+    Fetch transcript from YouTube captions API only.
+
+    Uses cookies.txt when available to reduce 403/verification issues on
+    Streamlit Cloud. Whisper fallback is handled by the caller.
     """
     try:
-        api = YouTubeTranscriptApi()
+        cookies_path = app_path("cookies.txt")
         language_codes = tuple(languages) if languages else ("en",)
+        if os.path.exists(cookies_path):
+            try:
+                api = YouTubeTranscriptApi(cookies=cookies_path)
+            except TypeError:
+                try:
+                    api = YouTubeTranscriptApi(cookie_path=cookies_path)
+                except TypeError:
+                    api = YouTubeTranscriptApi()
+        else:
+            api = YouTubeTranscriptApi()
+
         transcript = api.fetch(video_id, languages=language_codes)
         return transcript.to_raw_data()
     except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, Exception):
-        pass
-    
-    # Fallback: Use Whisper transcription
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
-    transcript = transcribe_with_whisper(video_url, video_id)
-    return transcript
+        return None
 
 
 def format_transcript(transcript: List[Dict], show_timestamps: bool = True) -> str:
@@ -825,6 +829,8 @@ def render_stage_1():
                     
                     with st.spinner("🔄 Analyzing Content..."):
                         transcript = fetch_transcript(video_id, languages=st.session_state.languages)
+                        if transcript is None:
+                            transcript = transcribe_with_whisper(video_url, video_id)
                         if transcript:
                             st.session_state.video_id = video_id
                             st.session_state.video_url = video_url
