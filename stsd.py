@@ -1,6 +1,6 @@
 """
 ================================================================================
-🎬 HAMZA AI - Professional Short-Form Engine (SaaS Edition)
+🎬 ViraFlow - Professional Short-Form Engine (SaaS Edition)
 ================================================================================
 Production-ready Streamlit application for AI-driven YouTube short creation.
 Optimized for Streamlit Cloud deployment with cloud-safe paths and headless mode.
@@ -58,7 +58,7 @@ def temp_path(filename: str) -> str:
 def build_yt_dlp_command(
 	url: str,
 	output_template: str,
-	format_selector: str = "best[ext=mp4]",
+	format_selector: str = "best[ext=mp4]/best",
 	extra_flags: Optional[List[str]] = None,
 	section_spec: Optional[str] = None
 ) -> List[str]:
@@ -91,6 +91,21 @@ def build_yt_dlp_command(
 	
 	cmd.append(url)
 	return cmd
+
+
+def tail_text(output_text: str, max_lines: int = 20) -> str:
+	"""Return the last non-empty lines from a command output string."""
+	lines = [line.rstrip() for line in (output_text or "").splitlines() if line.strip()]
+	if not lines:
+		return ""
+	return "\n".join(lines[-max_lines:])
+
+
+def store_yt_dlp_error(stdout_text: str = "", stderr_text: str = "") -> str:
+	"""Persist yt-dlp diagnostics for the UI and return a compact tail."""
+	tail = tail_text("\n".join(part for part in [stdout_text, stderr_text] if part), max_lines=20)
+	st.session_state.last_yt_dlp_error = tail
+	return tail
 
 
 # ============= TRANSCRIPTION INTELLIGENCE ENGINE =============
@@ -205,7 +220,7 @@ def transcribe_with_whisper(video_url: str, video_id: str) -> Optional[List[Dict
 
 # ============= PAGE CONFIG & STYLING =============
 st.set_page_config(
-	page_title="HAMZA AI - Viral Shorts Engine",
+	page_title="ViraFlow - Viral Shorts Engine",
 	layout="wide",
 	initial_sidebar_state="expanded"
 )
@@ -357,6 +372,7 @@ def init_session_state():
 		"custom_keywords": "",
 		"use_custom_keywords": False,
 		"transcription_status": None,
+		"last_yt_dlp_error": "",
 	}
 	for key, value in defaults.items():
 		if key not in st.session_state:
@@ -366,7 +382,7 @@ def init_session_state():
 init_session_state()
 
 # ============= PROFESSIONAL HEADER & FOOTER =============
-st.markdown('<div class="header-title">🎬 HAMZA AI | Viral Shorts Engine</div>', unsafe_allow_html=True)
+st.markdown('<div class="header-title">🎬 ViraFlow | Viral Shorts Engine</div>', unsafe_allow_html=True)
 st.markdown("---")
 
 
@@ -514,6 +530,77 @@ def format_hhmmss(seconds_value: float) -> str:
 	seconds = total_seconds % 60
 	return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
+def run_download_attempt(format_selector: str, attempt_label: str) -> Tuple[bool, str]:
+	"""Run a single yt-dlp section download attempt and capture diagnostics."""
+	if os.path.exists(temp_clip_path):
+		try:
+			os.remove(temp_clip_path)
+		except Exception:
+			pass
+
+	cmd = build_yt_dlp_command(
+		video_url,
+		temp_clip_path,
+		format_selector=format_selector,
+		section_spec=section_spec,
+	)
+
+	if status_placeholder:
+		status_placeholder.info(f"🛡️ Downloading video segment ({attempt_label})...")
+
+	try:
+		proc = subprocess.Popen(
+			cmd,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True,
+			creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+		)
+	except FileNotFoundError:
+		return False, "yt-dlp not found on PATH."
+	except Exception as e:
+		return False, f"Download error: {e}"
+
+	try:
+		stdout_text, stderr_text = proc.communicate(timeout=90)
+	except subprocess.TimeoutExpired:
+		proc.kill()
+		stdout_text, stderr_text = proc.communicate()
+	except Exception as e:
+		try:
+			proc.kill()
+		except Exception:
+			pass
+		return False, f"Download communication error: {e}"
+
+	if os.path.exists(temp_clip_path) and os.path.getsize(temp_clip_path) > 100000:
+		return True, ""
+
+	tail = store_yt_dlp_error(stdout_text, stderr_text)
+	if not tail:
+		tail = "yt-dlp finished without producing a usable clip."
+	return False, tail
+
+	# Step 1: Cloud-safe headless download
+	attempts = [
+		("best[ext=mp4]/best", "standard format"),
+		("worst[ext=mp4]/worst", "smaller fallback format"),
+	]
+
+	last_error = ""
+	for format_selector, attempt_label in attempts:
+		success, error_tail = run_download_attempt(format_selector, attempt_label)
+		if success:
+			last_error = ""
+			break
+		last_error = error_tail
+
+	if not os.path.exists(temp_clip_path):
+		if status_placeholder:
+			status_placeholder.error("❌ Download blocked on Streamlit Cloud. See yt-dlp stderr below.")
+			if last_error:
+				st.code(last_error, language="text")
+		return None
 
 def parse_custom_keywords(keywords_str: str) -> List[str]:
 	"""Parse comma-separated keywords into a list."""
@@ -566,6 +653,8 @@ def render_short_clip_ffmpeg(
 		"-ss", str(start_time),
 		"-to", str(end_time),
 		"-i", input_file,
+		"-map", "0:v:0",
+		"-map", "0:a?",
 		"-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
 		"-c:v", "libx264",
 		"-preset", "ultrafast",
@@ -573,6 +662,7 @@ def render_short_clip_ffmpeg(
 		"-pix_fmt", "yuv420p",
 		"-c:a", "aac",
 		"-b:a", audio_bitrate,
+		"-movflags", "+faststart",
 		output_file,
 	]
 	
@@ -643,57 +733,74 @@ def create_viral_short(
 	end_ts = format_hhmmss(start_seconds + duration)
 	section_spec = f"*{start_ts}-{end_ts}"
 	
-	# Step 1: Cloud-safe headless download
-	if status_placeholder:
-		status_placeholder.info("🛡️ Downloading video segment (headless mode)...")
-	
-	cmd = build_yt_dlp_command(
-		video_url,
-		temp_clip_path,
-		format_selector="best[ext=mp4]",
-		section_spec=section_spec,
-	)
-	
-	try:
-		proc = subprocess.Popen(
-			cmd,
-			stdout=subprocess.PIPE,
-			stderr=subprocess.PIPE,
-			text=True,
-			creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+	def run_download_attempt(format_selector: str, attempt_label: str) -> Tuple[bool, str]:
+		"""Run one yt-dlp section download attempt and capture diagnostics."""
+		if os.path.exists(temp_clip_path):
+			try:
+				os.remove(temp_clip_path)
+			except Exception:
+				pass
+
+		cmd = build_yt_dlp_command(
+			video_url,
+			temp_clip_path,
+			format_selector=format_selector,
+			section_spec=section_spec,
 		)
-	except FileNotFoundError:
+
 		if status_placeholder:
-			status_placeholder.error("❌ yt-dlp not found")
-		return None
-	except Exception as e:
-		if status_placeholder:
-			status_placeholder.error(f"❌ Download error: {e}")
-		return None
-	
-	# Wait for download with 30s timeout
-	timeout_seconds = 30
-	poll_interval = 0.5
-	waited = 0.0
-	
-	while waited < timeout_seconds:
-		if os.path.exists(temp_clip_path) and os.path.getsize(temp_clip_path) > 100000:  # 100KB minimum
+			status_placeholder.info(f"🛡️ Downloading video segment ({attempt_label})...")
+
+		try:
+			proc = subprocess.Popen(
+				cmd,
+				stdout=subprocess.PIPE,
+				stderr=subprocess.PIPE,
+				text=True,
+				creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+			)
+		except FileNotFoundError:
+			return False, "yt-dlp not found on PATH."
+		except Exception as e:
+			return False, f"Download error: {e}"
+
+		try:
+			stdout_text, stderr_text = proc.communicate(timeout=90)
+		except subprocess.TimeoutExpired:
+			proc.kill()
+			stdout_text, stderr_text = proc.communicate()
+		except Exception as e:
+			try:
+				proc.kill()
+			except Exception:
+				pass
+			return False, f"Download communication error: {e}"
+
+		if os.path.exists(temp_clip_path) and os.path.getsize(temp_clip_path) > 100000:
+			return True, ""
+
+		tail = store_yt_dlp_error(stdout_text, stderr_text)
+		if not tail:
+			tail = "yt-dlp finished without producing a usable clip."
+		return False, tail
+
+	# Step 1: Cloud-safe headless download with a smaller fallback format
+	last_error = ""
+	for format_selector, attempt_label in [
+		("best[ext=mp4]/best", "standard format"),
+		("worst[ext=mp4]/worst", "smaller fallback format"),
+	]:
+		success, error_tail = run_download_attempt(format_selector, attempt_label)
+		if success:
+			last_error = ""
 			break
-		time.sleep(poll_interval)
-		waited += poll_interval
-	
-	# Wait for process to finish
-	try:
-		proc.communicate(timeout=60)
-	except subprocess.TimeoutExpired:
-		proc.kill()
-		proc.wait()
-	except Exception:
-		pass
-	
+		last_error = error_tail
+
 	if not os.path.exists(temp_clip_path):
 		if status_placeholder:
-			status_placeholder.error("❌ YouTube verification required. Please try again.")
+			status_placeholder.error("❌ Download blocked on Streamlit Cloud. See yt-dlp stderr below.")
+		if last_error:
+			st.code(last_error, language="text")
 		return None
 	
 	# Step 2: Professional FFmpeg vertical mastering
@@ -958,7 +1065,10 @@ def render_stage_3():
 						st.rerun()
 		else:
 			status_container.update(label="❌ Rendering failed", state="error", expanded=True)
-			result_container.error("❌ Failed to create short. YouTube may require verification. Please try another video.")
+			result_container.error("❌ Failed to create short. Download may be blocked on Streamlit Cloud.")
+			last_error = st.session_state.get("last_yt_dlp_error", "")
+			if last_error:
+				st.code(last_error, language="text")
 	
 	except Exception as e:
 		status_container.update(label="❌ Error", state="error", expanded=True)
