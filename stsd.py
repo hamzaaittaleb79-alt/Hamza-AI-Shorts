@@ -62,19 +62,7 @@ def build_yt_dlp_command(
     extra_flags: Optional[List[str]] = None,
     section_spec: Optional[str] = None
 ) -> List[str]:
-    """
-    Build a cloud-safe, headless yt-dlp command.
-    
-    Args:
-        url: YouTube URL
-        output_template: Output file path template
-        format_selector: Format string for yt-dlp -f flag
-        extra_flags: Additional CLI flags
-        section_spec: Section specification for --download-sections (e.g., "*00:31:22-00:32:07")
-    
-    Returns:
-        List of command arguments ready for subprocess
-    """
+    """نسخة مستر حمزة المعدلة لدعم الكوكيز وتخطي الحظر"""
     cmd = [
         "yt-dlp",
         "-f", format_selector,
@@ -82,6 +70,10 @@ def build_yt_dlp_command(
         "--user-agent", DEFAULT_USER_AGENT,
         "-o", output_template,
     ]
+    
+    # السطر السحري: إذا وجد ملف الكوكيز في السيرفر سيستخدمه فوراً
+    if os.path.exists(app_path("cookies.txt")):
+        cmd.extend(["--cookies", app_path("cookies.txt")])
     
     if section_spec:
         cmd.extend(["--download-sections", section_spec, "--force-keyframes-at-cuts"])
