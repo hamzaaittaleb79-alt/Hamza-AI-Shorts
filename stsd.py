@@ -26,13 +26,6 @@ import yt_dlp
 
 # ============= OPTIONAL IMPORTS (Graceful Fallback) =============
 try:
-    from faster_whisper import WhisperModel
-    HAS_WHISPER = True
-except ImportError:
-    HAS_WHISPER = False
-    WhisperModel = None
-
-try:
     from openai import OpenAI
     HAS_OPENAI = True
 except ImportError:
@@ -93,40 +86,6 @@ def build_yt_dlp_command(url: str, output_template: str, format_selector: str = 
     return cmd
 
 
-def build_audio_dlp_command(url: str, output_template: str) -> List[str]:
-    """Build a yt-dlp command optimized for audio extraction only."""
-    video_id = extract_video_id(url)
-    if not video_id:
-        raise ValueError("Invalid YouTube URL or video ID")
-
-    invidious_instances = [
-        "https://yewtu.be",
-        "https://invidious.snopyta.org",
-        "https://invidious.kavin.rocks",
-        "https://vid.puffyan.us",
-        "https://inv.riverside.rocks",
-    ]
-
-    proxy_url = f"{random.choice(invidious_instances)}/watch?v={video_id}"
-
-    cmd = [
-        "yt-dlp",
-        "-f", "bestaudio/best",
-        "--no-check-certificate",
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-        "-o", output_template,
-        "--extract-audio",
-        "--audio-format", "mp3",
-        "--extractor-args", "youtube:player_client=web",
-        "--force-ipv4",
-    ]
-
-    if os.path.exists("cookies.txt"):
-        cmd.extend(["--cookies", "cookies.txt"])
-
-    cmd.append(proxy_url)
-    return cmd
-
 def tail_text(output_text: str, max_lines: int = 20) -> str:
     """Return the last non-empty lines from a command output string."""
     lines = [line.rstrip() for line in (output_text or "").splitlines() if line.strip()]
@@ -142,112 +101,86 @@ def store_yt_dlp_error(stdout_text: str = "", stderr_text: str = "") -> str:
     return tail
 
 
-# ============= TRANSCRIPTION INTELLIGENCE ENGINE =============
-@st.cache_resource
-def load_whisper_model():
-    """
-    Load faster-whisper model once per session.
-    Uses base model with int8 quantization for memory efficiency on Streamlit Cloud.
-    """
-    if not HAS_WHISPER:
-        return None
-    try:
-        return WhisperModel("base", device="cpu", compute_type="int8")
-    except Exception:
-        return None
+# ============= TRANSCRIPTION INTELLIGENCE ENGINE (Optimized) =============
+# Removed audio download to prevent HTTP 403 blocking on Streamlit Cloud
+# Now uses direct YouTube caption APIs and Piped/Invidious fallbacks
 
 
-def download_audio_for_transcription(video_url: str, video_id: str) -> Optional[str]:
-    """Download audio from YouTube for Whisper transcription."""
-    output_template = temp_path(f"whisper_audio_{video_id}.%(ext)s")
-    try:
-        cmd = build_audio_dlp_command(video_url, output_template)
-    except ValueError:
-        return None
+def transcribe_with_piped_api(video_id: str) -> Optional[List[Dict]]:
+    """
+    Fetch transcript from Piped or Invidious API when YouTube captions unavailable.
+    Avoids audio download entirely (prevents 403 blocking).
+    """
+    # Piped API endpoints for captions
+    piped_instances = [
+        "https://piped.video/api/v1",
+        "https://piped.kavin.rocks/api/v1",
+        "https://piped-mirror.kavin.rocks/api/v1",
+    ]
     
-    try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        )
-    except Exception:
-        return None
-    
-    if proc.returncode != 0:
-        return None
-    
-    # Check for audio file in multiple formats
-    for ext in ("mp3", "m4a", "webm", "mkv"):
-        candidate = temp_path(f"whisper_audio_{video_id}.{ext}")
-        if os.path.exists(candidate):
-            return candidate
+    for base_url in piped_instances:
+        try:
+            url = f"{base_url}/captions/{video_id}"
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                captions = data.get("captions", [])
+                if captions:
+                    # Try to find English or Arabic captions first
+                    target_caption = None
+                    for cap in captions:
+                        if cap.get("code") in ("en", "ar"):
+                            target_caption = cap
+                            break
+                    if not target_caption and captions:
+                        target_caption = captions[0]
+                    
+                    if target_caption:
+                        caption_url = target_caption.get("url", "")
+                        if caption_url:
+                            caption_response = requests.get(caption_url, timeout=10)
+                            if caption_response.status_code == 200:
+                                lines = caption_response.text.splitlines()
+                                transcript = []
+                                time_offset = 0.0
+                                for line in lines:
+                                    line = line.strip()
+                                    if line and not line.startswith("["):
+                                        transcript.append({
+                                            "text": line,
+                                            "start": time_offset,
+                                            "duration": 5.0,
+                                        })
+                                        time_offset += 5.0
+                                if transcript:
+                                    return transcript
+        except Exception:
+            continue
     
     return None
 
 
 def transcribe_with_whisper(video_url: str, video_id: str) -> Optional[List[Dict]]:
     """
-    Transcribe video using faster-whisper (local CPU) or OpenAI Whisper API.
-    Gracefully falls back if services are unavailable.
+    Fetch transcript intelligently without downloading audio (prevents 403 blocking).
+    
+    Strategy:
+    1. Try YouTube API (already cached in fetch_transcript)
+    2. Try Piped/Invidious API for alternative captions
+    3. Skip Whisper audio download entirely to avoid HTTP 403 bans
     """
-    # Try OpenAI API first if key is available
-    if HAS_OPENAI and os.getenv("OPENAI_API_KEY"):
-        audio_path = download_audio_for_transcription(video_url, video_id)
-        if audio_path:
-            try:
-                client = OpenAI()
-                with open(audio_path, "rb") as audio_file:
-                    result = client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=audio_file,
-                        response_format="verbose_json",
-                    )
-                
-                segments = []
-                for item in getattr(result, "segments", []) or []:
-                    segments.append({
-                        "text": item.get("text", "").strip(),
-                        "start": float(item.get("start", 0.0)),
-                        "duration": float(item.get("end", 0.0)) - float(item.get("start", 0.0)),
-                    })
-                return segments or None
-            except Exception:
-                pass
-            finally:
-                try:
-                    os.remove(audio_path)
-                except Exception:
-                    pass
+    # First attempt: Use the main fetch_transcript which has cookie support
+    transcript = fetch_transcript(video_id, languages=["en", "ar"])
+    if transcript:
+        return transcript
     
-    # Fall back to local faster-whisper
-    model = load_whisper_model()
-    if not model:
-        return None
+    # Second attempt: Use Piped API as fallback
+    transcript = transcribe_with_piped_api(video_id)
+    if transcript:
+        return transcript
     
-    audio_path = download_audio_for_transcription(video_url, video_id)
-    if not audio_path:
-        return None
-    
-    try:
-        segments, _info = model.transcribe(audio_path, vad_filter=True)
-        transcript = []
-        for seg in segments:
-            transcript.append({
-                "text": seg.text.strip(),
-                "start": float(seg.start),
-                "duration": float(seg.end - seg.start),
-            })
-        return transcript or None
-    except Exception:
-        return None
-    finally:
-        try:
-            os.remove(audio_path)
-        except Exception:
-            pass
+    # All caption sources exhausted - return None instead of blocking on audio
+    return None
 
 
 # ============= PAGE CONFIG & STYLING =============
