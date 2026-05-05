@@ -1109,6 +1109,7 @@ st.markdown(
     'Powered by GitHub Education</div>',
     unsafe_allow_html=True
 )
+"""
 ================================================================================
 🎬 ViraFlow - Professional Short-Form Engine (SaaS Edition)
 ================================================================================
