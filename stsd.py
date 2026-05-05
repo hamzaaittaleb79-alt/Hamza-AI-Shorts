@@ -9,7 +9,7 @@ Author: MR. HAMZA AIT TALEB
 GitHub Education Partner | AI Intelligence Engine
 ================================================================================
 """
-
+import random
 import re
 import json
 import os
@@ -55,32 +55,39 @@ def temp_path(filename: str) -> str:
 
 
 # ============= yt-dlp COMMAND BUILDER (Cloud-Compatible) =============
-def build_yt_dlp_command(url: str, output_template: str, format_selector: str = "best", section_spec=None) -> List[str]:
-    # استخراج معرف الفيديو فقط
-    video_id = url.split("v=")[-1].split("?")[0].split("/")[-1]
+def build_yt_dlp_command(url: str, output_template: str, format_selector: str = "best[ext=mp4]/best", section_spec: Optional[str] = None) -> List[str]:
+    # قائمة بسيرفرات وسيطة مجانية ومفتوحة المصدر
+    invidious_instances = [
+        "https://yewtu.be",
+        "https://invidious.snopyta.org",
+        "https://invidious.kavin.rocks",
+        "https://vid.puffyan.us",
+        "https://inv.riverside.rocks"
+    ]
     
-    # استخدام رابط وسيط (Invidious Instance) لتجاوز حظر Streamlit
-    # هذا الرابط يعمل كبروكسي مجاني
-    proxy_url = f"https://inv.tux.rs/latest/video?v={video_id}"
+    # تحويل رابط يوتيوب العادي إلى رابط وسيط لتجنب حظر الـ IP
+    video_id = extract_video_id(url)
+    proxy_url = f"{random.choice(invidious_instances)}/watch?v={video_id}"
     
     cmd = [
         "yt-dlp",
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "-f", "best[height<=720][ext=mp4]", # جودة 720p لضمان السرعة وتجنب الحظر
         "--no-check-certificate",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
         "-o", output_template,
-        "--geo-bypass",
+        # استخدام العميل المكتبي العادي عبر الوسيط
+        "--extractor-args", "youtube:player_client=web",
+        "--force-ipv4",
     ]
     
-    # إذا كان هناك قص للمقاطع، نستخدم الرابط الأصلي مع الكوكيز كخيار ثانٍ
-    # لكن للتحميل المباشر، نستخدم البروكسي
+    # إضافة ملف الكوكيز إذا كان موجوداً (اختياري مع الوسيط)
+    if os.path.exists("cookies.txt"):
+        cmd.extend(["--cookies", "cookies.txt"])
+    
     if section_spec:
         cmd.extend(["--download-sections", section_spec, "--force-keyframes-at-cuts"])
-        cmd.append(url)
-        if os.path.exists("cookies.txt"):
-            cmd.extend(["--cookies", "cookies.txt"])
-    else:
-        cmd.append(proxy_url)
-        
+    
+    cmd.append(proxy_url) # نرسل رابط الوسيط بدلاً من رابط يوتيوب
     return cmd
 
 def tail_text(output_text: str, max_lines: int = 20) -> str:
