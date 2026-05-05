@@ -1108,7 +1108,7 @@ st.markdown(
     '<div class="footer-branding">Designed & Developed by MR. HAMZA AIT TALEB | '
     'Powered by GitHub Education</div>',
     unsafe_allow_html=True
-)"""
+)
 ================================================================================
 🎬 ViraFlow - Professional Short-Form Engine (SaaS Edition)
 ================================================================================
