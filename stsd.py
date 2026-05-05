@@ -916,19 +916,50 @@ def render_stage_2():
 
 # ============= STAGE 3: RENDERING =============
 def render_stage_3():
-    """STAGE 3: Production rendering with professional feedback."""
-    st.markdown('<div class="stage-badge">🎨 STAGE 3: RENDERING</div>', unsafe_allow_html=True)
+    """واجهة مستر حمزة النهائية: تحميل مباشر بجودة عالية وتخطي حظر السيرفر"""
+    st.markdown("### 🎯 المرحلة النهائية: تحميل الفيديو بالجودة المطلوبة")
     
-    # Navigation
-    col_back, col_reset = st.columns(2)
-    with col_back:
-        if st.button("← Back to Selection"):
-            st.session_state.stage = 2
-            st.rerun()
-    with col_reset:
-        if st.button("🏠 Home"):
-            st.session_state.stage = 1
-            st.rerun()
+    video_id = st.session_state.video_id
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    st.success("✅ تم تحليل الفيديو بنجاح! اختر الجودة والمحرك للتحميل المباشر:")
+
+    # تصميم بطاقات التحميل
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        with st.container(border=True):
+            st.markdown("#### 🚀 المحرك السريع (Cobalt)")
+            st.write("يدعم 1080p و 4K مباشرة")
+            # هذا الرابط يفتح موقع تحميل احترافي ومجاني معبأ برابط الفيديو الخاص بك
+            st.markdown(f'''
+                <a href="https://cobalt.tools/" target="_blank">
+                    <button style="width:100%; background-color:#FFD700; border:none; color:black; padding:12px; cursor:pointer; border-radius:8px; font-weight:bold;">
+                        فتح محرك Cobalt للتحميل
+                    </button>
+                </a>
+            ''', unsafe_allow_html=True)
+            st.caption("انسخ الرابط وضعه في Cobalt للحصول على أعلى جودة.")
+
+    with col2:
+        with st.container(border=True):
+            st.markdown("#### ⚡ المحرك الاحترافي (SaveFrom)")
+            st.write("تحميل مباشر وسهل")
+            st.markdown(f'''
+                <a href="https://en.savefrom.net/18/#url={video_url}" target="_blank">
+                    <button style="width:100%; background-color:#00E676; border:none; color:white; padding:12px; cursor:pointer; border-radius:8px; font-weight:bold;">
+                        تحميل عبر SaveFrom
+                    </button>
+                </a>
+            ''', unsafe_allow_html=True)
+            st.caption("سيفتح الموقع والرابط جاهز للتحميل فوراً.")
+
+    st.info(f"🔗 رابط الفيديو الخاص بك: `{video_url}`")
+    
+    if st.button("🔄 تحليل فيديو آخر"):
+        st.session_state.stage = 1
+        st.session_state.video_id = None
+        st.rerun()
     
     st.markdown("---")
     
