@@ -108,52 +108,110 @@ def store_yt_dlp_error(stdout_text: str = "", stderr_text: str = "") -> str:
 
 def transcribe_with_piped_api(video_id: str) -> Optional[List[Dict]]:
     """
-    Fetch transcript from Piped or Invidious API when YouTube captions unavailable.
-    Avoids audio download entirely (prevents 403 blocking).
+    Fetch transcript from Piped or Invidious API with enhanced parsing.
+    Supports VTT, JSON, and plain text caption formats.
     """
-    # Piped API endpoints for captions
     piped_instances = [
         "https://piped.video/api/v1",
         "https://piped.kavin.rocks/api/v1",
         "https://piped-mirror.kavin.rocks/api/v1",
     ]
     
+    def parse_vtt_captions(vtt_text: str) -> Optional[List[Dict]]:
+        """Parse WebVTT format captions."""
+        try:
+            lines = vtt_text.split('\n')
+            transcript = []
+            current_time = 0.0
+            
+            for line in lines:
+                line = line.strip()
+                
+                # Skip headers and empty lines
+                if not line or line.startswith('WEBVTT') or line.startswith('NOTE'):
+                    continue
+                
+                # Parse timestamp lines (format: HH:MM:SS.mmm --> HH:MM:SS.mmm)
+                if '-->' in line:
+                    try:
+                        start_str = line.split('-->')[0].strip()
+                        # Parse HH:MM:SS.mmm format
+                        parts = start_str.split(':')
+                        if len(parts) == 3:
+                            hours = int(parts[0])
+                            minutes = int(parts[1])
+                            seconds = float(parts[2])
+                            current_time = hours * 3600 + minutes * 60 + seconds
+                    except Exception:
+                        pass
+                # Parse text lines
+                elif line and not '-->' in line and current_time >= 0:
+                    transcript.append({
+                        "text": line,
+                        "start": current_time,
+                        "duration": 5.0,
+                    })
+            
+            return transcript if transcript else None
+        except Exception:
+            return None
+    
     for base_url in piped_instances:
         try:
+            # Try to fetch captions list
             url = f"{base_url}/captions/{video_id}"
-            response = requests.get(url, timeout=10)
+            response = requests.get(url, timeout=10, headers={"User-Agent": DEFAULT_USER_AGENT})
+            
             if response.status_code == 200:
                 data = response.json()
                 captions = data.get("captions", [])
+                
                 if captions:
-                    # Try to find English or Arabic captions first
+                    # Try to find preferred languages
                     target_caption = None
                     for cap in captions:
-                        if cap.get("code") in ("en", "ar"):
+                        if cap.get("code") in ("en", "ar", "es", "fr"):
                             target_caption = cap
                             break
+                    
                     if not target_caption and captions:
                         target_caption = captions[0]
                     
                     if target_caption:
                         caption_url = target_caption.get("url", "")
                         if caption_url:
-                            caption_response = requests.get(caption_url, timeout=10)
-                            if caption_response.status_code == 200:
-                                lines = caption_response.text.splitlines()
-                                transcript = []
-                                time_offset = 0.0
-                                for line in lines:
-                                    line = line.strip()
-                                    if line and not line.startswith("["):
-                                        transcript.append({
-                                            "text": line,
-                                            "start": time_offset,
-                                            "duration": 5.0,
-                                        })
-                                        time_offset += 5.0
-                                if transcript:
-                                    return transcript
+                            try:
+                                caption_response = requests.get(
+                                    caption_url, 
+                                    timeout=10,
+                                    headers={"User-Agent": DEFAULT_USER_AGENT}
+                                )
+                                
+                                if caption_response.status_code == 200:
+                                    # Try VTT format first
+                                    transcript = parse_vtt_captions(caption_response.text)
+                                    if transcript:
+                                        return transcript
+                                    
+                                    # Fallback: parse as plain text
+                                    lines = caption_response.text.splitlines()
+                                    transcript = []
+                                    time_offset = 0.0
+                                    
+                                    for line in lines:
+                                        line = line.strip()
+                                        if line and not line.startswith("[") and not "-->" in line:
+                                            transcript.append({
+                                                "text": line,
+                                                "start": time_offset,
+                                                "duration": 5.0,
+                                            })
+                                            time_offset += 5.0
+                                    
+                                    if transcript:
+                                        return transcript
+                            except Exception:
+                                pass
         except Exception:
             continue
     
@@ -162,24 +220,53 @@ def transcribe_with_piped_api(video_id: str) -> Optional[List[Dict]]:
 
 def transcribe_with_whisper(video_url: str, video_id: str) -> Optional[List[Dict]]:
     """
-    Fetch transcript intelligently without downloading audio (prevents 403 blocking).
+    Fetch transcript intelligently without audio download (prevents 403 blocking).
     
     Strategy:
-    1. Try YouTube API (already cached in fetch_transcript)
-    2. Try Piped/Invidious API for alternative captions
-    3. Skip Whisper audio download entirely to avoid HTTP 403 bans
+    1. Try YouTube API with cookie support
+    2. Try YouTube API with multiple language fallbacks
+    3. Try Piped/Invidious APIs
+    4. Return None if all methods fail
     """
-    # First attempt: Use the main fetch_transcript which has cookie support
-    transcript = fetch_transcript(video_id, languages=["en", "ar"])
-    if transcript:
-        return transcript
+    # Attempt 1: Use the main fetch_transcript with user's selected languages
+    try:
+        transcript = fetch_transcript(video_id, languages=None)
+        if transcript and len(transcript) > 0:
+            return transcript
+    except Exception:
+        pass
     
-    # Second attempt: Use Piped API as fallback
-    transcript = transcribe_with_piped_api(video_id)
-    if transcript:
-        return transcript
+    # Attempt 2: Try specific language combinations
+    language_attempts = [
+        ["en"],
+        ["ar"],
+        ["es"],
+        ["fr"],
+        ["pt"],
+        ["de"],
+        ["ja"],
+        ["ru"],
+        ["zh-Hans"],
+        ["zh-Hant"],
+    ]
     
-    # All caption sources exhausted - return None instead of blocking on audio
+    for langs in language_attempts:
+        try:
+            transcript = fetch_transcript(video_id, languages=langs)
+            if transcript and len(transcript) > 0:
+                return transcript
+        except Exception:
+            continue
+    
+    # Attempt 3: Use Piped API as fallback
+    try:
+        transcript = transcribe_with_piped_api(video_id)
+        if transcript and len(transcript) > 0:
+            return transcript
+    except Exception:
+        pass
+    
+    # All caption sources exhausted
     return None
 
 
@@ -374,14 +461,16 @@ def extract_video_id(url_or_id: str) -> Optional[str]:
 @st.cache_data
 def fetch_transcript(video_id: str, languages: Optional[List[str]] = None) -> Optional[List[Dict]]:
     """
-    Fetch transcript from YouTube captions API only.
-
-    Uses cookies.txt when available to reduce 403/verification issues on
-    Streamlit Cloud. Whisper fallback is handled by the caller.
+    Fetch transcript from YouTube captions API with smart language fallback.
+    Uses cookies.txt when available to reduce 403/verification issues on Streamlit Cloud.
     """
     try:
         cookies_path = app_path("cookies.txt")
-        language_codes = tuple(languages) if languages else ("en",)
+        
+        # Build language code list with fallbacks
+        language_codes = tuple(languages) if languages else ("en", "ar", "es", "fr")
+        
+        # Initialize API with cookies if available
         if os.path.exists(cookies_path):
             try:
                 api = YouTubeTranscriptApi(cookies=cookies_path)
@@ -393,9 +482,29 @@ def fetch_transcript(video_id: str, languages: Optional[List[str]] = None) -> Op
         else:
             api = YouTubeTranscriptApi()
 
-        transcript = api.fetch(video_id, languages=language_codes)
-        return transcript.to_raw_data()
-    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, Exception):
+        # Try fetching with specified languages
+        try:
+            transcript = api.fetch(video_id, languages=language_codes)
+            return transcript.to_raw_data()
+        except (TranscriptsDisabled, NoTranscriptFound):
+            # If specific languages fail, try any available language
+            try:
+                transcript = api.list_transcripts(video_id)
+                # Get first available transcript
+                available_langs = [t.language for t in transcript.manually_created_transcripts]
+                if not available_langs:
+                    available_langs = [t.language for t in transcript.generated_transcripts]
+                
+                if available_langs:
+                    transcript_data = transcript.find_transcript([available_langs[0]])
+                    return transcript_data.fetch()
+            except Exception:
+                pass
+        
+        return None
+    except VideoUnavailable:
+        return None
+    except Exception:
         return None
 
 
@@ -838,19 +947,49 @@ def render_stage_1():
                 else:
                     video_url = st.session_state.url if st.session_state.url.startswith("http") else f"https://www.youtube.com/watch?v={video_id}"
                     
-                    with st.spinner("🔄 Analyzing Content..."):
-                        transcript = fetch_transcript(video_id, languages=st.session_state.languages)
-                        if transcript is None:
-                            transcript = transcribe_with_whisper(video_url, video_id)
-                        if transcript:
-                            st.session_state.video_id = video_id
-                            st.session_state.video_url = video_url
-                            st.session_state.transcript = transcript
-                            st.session_state.transcript_text = format_transcript(transcript, show_timestamps=True)
-                            st.session_state.stage = 2
-                            st.rerun()
-                        else:
-                            st.error("❌ Could not fetch transcript for this video")
+                    # Create progress indicators
+                    status_placeholder = st.status("🔄 Fetching transcript...", expanded=True)
+                    
+                    try:
+                        with status_placeholder:
+                            # Step 1: Try YouTube API with selected languages
+                            st.write("📌 Trying YouTube API with selected languages...")
+                            transcript = fetch_transcript(video_id, languages=st.session_state.languages)
+                            
+                            if not transcript:
+                                st.write("📌 YouTube captions not available. Trying alternative sources...")
+                                transcript = transcribe_with_whisper(video_url, video_id)
+                            
+                            if transcript and len(transcript) > 0:
+                                st.write(f"✅ Successfully fetched {len(transcript)} caption segments!")
+                                status_placeholder.update(label="✅ Transcript loaded!", state="complete")
+                                
+                                st.session_state.video_id = video_id
+                                st.session_state.video_url = video_url
+                                st.session_state.transcript = transcript
+                                st.session_state.transcript_text = format_transcript(transcript, show_timestamps=True)
+                                st.session_state.stage = 2
+                                st.rerun()
+                            else:
+                                status_placeholder.update(label="❌ No captions available", state="error")
+                                st.error("""
+❌ **Cannot fetch transcript for this video**
+
+**Possible reasons:**
+- Video has no captions/subtitles (upload auto-captions first)
+- Video is age-restricted or private
+- Video is region-blocked
+- All caption services are temporarily unavailable
+
+**Try:**
+1. ✅ Enable auto-captions on YouTube (if you own the video)
+2. ✅ Try a different video
+3. ✅ Try again in a few minutes
+                                """)
+                    except Exception as e:
+                        status_placeholder.update(label="❌ Error", state="error")
+                        st.error(f"❌ Unexpected error: {str(e)}")
+                        st.write("Please try again or use a different video.")
 
 
 # ============= STAGE 2: SELECTION & PREVIEW =============
