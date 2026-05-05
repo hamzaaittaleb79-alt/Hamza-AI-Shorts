@@ -62,18 +62,25 @@ def build_yt_dlp_command(
     extra_flags: Optional[List[str]] = None,
     section_spec: Optional[str] = None
 ) -> List[str]:
-    """نسخة مستر حمزة المعدلة لدعم الكوكيز وتخطي الحظر"""
+    """
+    نسخة مستر حمزة الاحترافية: 
+    تتجاوز الحاجة لـ JavaScript Runtime عبر محاكاة أجهزة الأندرويد.
+    """
     cmd = [
         "yt-dlp",
         "-f", format_selector,
         "--no-check-certificate",
-        "--user-agent", DEFAULT_USER_AGENT,
+        "--user-agent", "Mozilla/5.0 (Android 14; Mobile; rv:120.0) Gecko/120.0 Firefox/120.0",
         "-o", output_template,
+        # الخدعة الكبرى: طلب الفيديو كأنه من تطبيق أندرويد (يتجاوز تشفير JS)
+        "--extractor-args", "youtube:player_client=android,ios;player_params=sig",
+        "--force-ipv4", # لتقليل احتمالية حظر السيرفر
     ]
     
-    cookies_path = app_path("cookies.txt")
-    if os.path.exists(cookies_path):
-        cmd.extend(["--cookies", cookies_path])
+    # ربط ملف الكوكيز إذا كان موجوداً
+    cookie_path = os.path.abspath("cookies.txt")
+    if os.path.exists(cookie_path):
+        cmd.extend(["--cookies", cookie_path])
     
     if section_spec:
         cmd.extend(["--download-sections", section_spec, "--force-keyframes-at-cuts"])
@@ -83,7 +90,6 @@ def build_yt_dlp_command(
     
     cmd.append(url)
     return cmd
-
 
 def tail_text(output_text: str, max_lines: int = 20) -> str:
     """Return the last non-empty lines from a command output string."""
