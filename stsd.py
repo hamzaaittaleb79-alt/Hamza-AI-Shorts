@@ -504,9 +504,68 @@ def transcribe_with_whisper(video_url: str, video_id: str) -> Optional[List[Dict
     except Exception:
         pass
     
-    # Level 2: Audio Download + Whisper
+    # Level 2: Audio Download + Whisper (robust: direct then proxy fallbacks with real browser UA)
     try:
         audio_path = download_audio_for_transcription(video_url, video_id)
+
+        # If initial download failed, attempt explicit yt-dlp attempts with real Chrome UA
+        if not audio_path:
+            output_template = temp_path(f"whisper_audio_{video_id}.%(ext)s")
+            ua = DEFAULT_USER_AGENT
+            invidious_instances = [
+                "https://yewtu.be",
+                "https://invidious.snopyta.org",
+                "https://invidious.kavin.rocks",
+                "https://vid.puffyan.us",
+                "https://inv.riverside.rocks",
+            ]
+
+            # Try direct URL first, then several invidious proxies to avoid 403s
+            attempt_urls = [video_url] + [f"{inst}/watch?v={video_id}" for inst in invidious_instances]
+
+            for attempt_url in attempt_urls:
+                try:
+                    cmd = [
+                        "yt-dlp",
+                        "-f", "worstaudio/best",
+                        "--extract-audio",
+                        "--audio-format", "m4a",
+                        "--audio-quality", "128K",
+                        "--no-check-certificate",
+                        "--user-agent", ua,
+                        "-o", output_template,
+                        "--quiet",
+                        "--no-warnings",
+                    ]
+                    cmd.append(attempt_url)
+
+                    proc = subprocess.run(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=90,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+
+                    if proc.returncode == 0:
+                        for ext in ("m4a", "mp3", "wav", "ogg"):
+                            candidate = temp_path(f"whisper_audio_{video_id}.{ext}")
+                            if os.path.exists(candidate) and os.path.getsize(candidate) > 50000:
+                                audio_path = candidate
+                                break
+                    else:
+                        # Store yt-dlp diagnostics for UI
+                        try:
+                            store_yt_dlp_error(proc.stdout, proc.stderr)
+                        except Exception:
+                            pass
+
+                    if audio_path:
+                        break
+                except Exception:
+                    continue
+
         if audio_path:
             transcript = transcribe_with_faster_whisper(audio_path)
             if transcript and len(transcript) > 0:
