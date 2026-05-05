@@ -55,39 +55,26 @@ def temp_path(filename: str) -> str:
 
 
 # ============= yt-dlp COMMAND BUILDER (Cloud-Compatible) =============
-def build_yt_dlp_command(
-    url: str,
-    output_template: str,
-    format_selector: str = "best[ext=mp4]/best",
-    extra_flags: Optional[List[str]] = None,
-    section_spec: Optional[str] = None
-) -> List[str]:
-    """
-    نسخة مستر حمزة الاحترافية: 
-    تتجاوز الحاجة لـ JavaScript Runtime عبر محاكاة أجهزة الأندرويد.
-    """
+def build_yt_dlp_command(url, output_template, format_selector="best[ext=mp4]/best", section_spec=None):
     cmd = [
         "yt-dlp",
-        "-f", format_selector,
+        "-f", "best[height<=720][ext=mp4]", # تحديد جودة متوسطة لتقليل الحظر
         "--no-check-certificate",
-        "--user-agent", "Mozilla/5.0 (Android 14; Mobile; rv:120.0) Gecko/120.0 Firefox/120.0",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "-o", output_template,
-        # الخدعة الكبرى: طلب الفيديو كأنه من تطبيق أندرويد (يتجاوز تشفير JS)
-        "--extractor-args", "youtube:player_client=android,ios;player_params=sig",
-        "--force-ipv4", # لتقليل احتمالية حظر السيرفر
+        # استخدام Web Embedded يتجاوز طلب الـ PO Token في كثير من الأحيان
+        "--extractor-args", "youtube:player_client=web_embedded,mweb;player_params=sig",
+        "--force-ipv4",
+        "--geo-bypass", # محاولة تخطي القيود الجغرافية
     ]
     
-    # ربط ملف الكوكيز إذا كان موجوداً
-    cookie_path = os.path.abspath("cookies.txt")
-    if os.path.exists(cookie_path):
-        cmd.extend(["--cookies", cookie_path])
+    # استخدام الكوكيز ضروري جداً هنا
+    if os.path.exists("cookies.txt"):
+        cmd.extend(["--cookies", "cookies.txt"])
     
     if section_spec:
         cmd.extend(["--download-sections", section_spec, "--force-keyframes-at-cuts"])
-    
-    if extra_flags:
-        cmd.extend(extra_flags)
-    
+        
     cmd.append(url)
     return cmd
 
