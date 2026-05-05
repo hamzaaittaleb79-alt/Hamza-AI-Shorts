@@ -1,4 +1,4 @@
-"""
+ """
 ================================================================================
 🎬 ViraFlow - Professional Short-Form Engine (SaaS Edition)
 ================================================================================
@@ -292,76 +292,6 @@ def analyze_from_metadata(metadata: Dict) -> Optional[List[Dict]]:
         return None
 
 
-def transcribe_with_whisper(video_url: str, video_id: str) -> Optional[List[Dict]]:
-    """
-    🎯 MASTER TRANSCRIPTION FUNCTION with 5-level fallback strategy:
-    
-    1️⃣ YouTube API (already handled in fetch_transcript)
-    2️⃣ Audio Download + Whisper Transcription (fallback)
-    3️⃣ Piped/Invidious APIs (alternative source)
-    4️⃣ Video Metadata Analysis (title + description)
-    5️⃣ Synthetic Content (last resort - never returns None!)
-    
-    ⚠️ NEVER returns None - always tries to provide something
-    """
-    
-    # Attempt 1: Try YouTube API (fetches both captions and auto-generated)
-    try:
-        transcript = fetch_transcript(video_id, languages=None)
-        if transcript and len(transcript) > 0:
-            return transcript
-    except Exception:
-        pass
-    
-    # Attempt 2: Audio Download + Whisper
-    try:
-        audio_path = download_audio_for_transcription(video_url, video_id)
-        if audio_path:
-            transcript = transcribe_with_faster_whisper(audio_path)
-            if transcript and len(transcript) > 0:
-                return transcript
-    except Exception:
-        pass
-    
-    # Attempt 3: Piped/Invidious API
-    try:
-        transcript = transcribe_with_piped_api(video_id)
-        if transcript and len(transcript) > 0:
-            return transcript
-    except Exception:
-        pass
-    
-    # Attempt 4: Extract Metadata (title + description)
-    try:
-        metadata = extract_video_metadata(video_id)
-        if metadata:
-            transcript = analyze_from_metadata(metadata)
-            if transcript and len(transcript) > 0:
-                return transcript
-    except Exception:
-        pass
-    
-    # Attempt 5: Language fallback attempts
-    language_attempts = [
-        ["en"], ["ar"], ["es"], ["fr"], ["pt"], ["de"], ["it"], ["ja"], ["ru"], ["zh-Hans"], ["ko"],
-    ]
-    
-    for langs in language_attempts:
-        try:
-            transcript = fetch_transcript(video_id, languages=langs)
-            if transcript and len(transcript) > 0:
-                return transcript
-        except Exception:
-            continue
-    
-    # ⚠️ LAST RESORT: Return generic content so app doesn't crash
-    return [{
-        "text": "Unable to extract transcript. Using video analysis mode.",
-        "start": 0.0,
-        "duration": 10.0,
-    }]
-
-
 def transcribe_with_piped_api(video_id: str) -> Optional[List[Dict]]:
     """
     Fetch transcript from Piped or Invidious APIs (backup method).
@@ -482,21 +412,127 @@ def transcribe_with_piped_api(video_id: str) -> Optional[List[Dict]]:
     return None
 
 
+def fetch_transcript_from_wayback(video_id: str) -> Optional[List[Dict]]:
+    """
+    محاولة سحب الترجمة من wayback.tube (لا يحتاج تحميل ملفات)
+    آمن تماماً مع Streamlit Cloud - طلب HTTP بسيط فقط
+    """
+    try:
+        url = f"https://wayback.tube/video/{video_id}"
+        response = requests.get(url, timeout=10, headers={"User-Agent": DEFAULT_USER_AGENT})
+        
+        if response.status_code == 200:
+            # محاولة استخراج البيانات من HTML
+            import re as regex_module
+            captions_match = regex_module.search(r'"captions":\s*(\[.*?\])', response.text)
+            if captions_match:
+                try:
+                    captions_json = json.loads(captions_match.group(1))
+                    transcript = []
+                    for idx, caption in enumerate(captions_json[:100]):  # أول 100 كابشن
+                        text = caption.get("text", "").strip()
+                        if text:
+                            transcript.append({
+                                "text": text,
+                                "start": float(caption.get("start", idx * 5)),
+                                "duration": float(caption.get("duration", 5.0)),
+                            })
+                    return transcript if transcript else None
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    
+    return None
+
+
+def fetch_transcript_from_yewtu(video_id: str) -> Optional[List[Dict]]:
+    """
+    محاولة سحب الترجمة من yewtu.be (وسيط Invidious آمن)
+    طلب HTTP API بسيط - لا تحميل ملفات
+    """
+    try:
+        url = f"https://yewtu.be/api/v1/captions/{video_id}"
+        response = requests.get(url, timeout=10, headers={"User-Agent": DEFAULT_USER_AGENT})
+        
+        if response.status_code == 200:
+            data = response.json()
+            captions = data.get("captions", [])
+            
+            if captions:
+                # اختر الكابشن بلغة إنجليزية أو أي لغة متاحة
+                target_lang = None
+                for cap in captions:
+                    if cap.get("language_code", "").startswith("en"):
+                        target_lang = cap
+                        break
+                if not target_lang:
+                    target_lang = captions[0]
+                
+                caption_url = target_lang.get("url", "")
+                if caption_url:
+                    try:
+                        caption_response = requests.get(
+                            caption_url,
+                            timeout=10,
+                            headers={"User-Agent": DEFAULT_USER_AGENT}
+                        )
+                        
+                        if caption_response.status_code == 200:
+                            # محاولة تحليل VTT
+                            lines = caption_response.text.split('\n')
+                            transcript = []
+                            current_time = 0.0
+                            
+                            for line in lines:
+                                line = line.strip()
+                                if not line or line.startswith('WEBVTT') or line.startswith('NOTE'):
+                                    continue
+                                
+                                if '-->' in line:
+                                    try:
+                                        start_str = line.split('-->')[0].strip()
+                                        parts = start_str.split(':')
+                                        if len(parts) == 3:
+                                            hours = int(parts[0])
+                                            minutes = int(parts[1])
+                                            seconds = float(parts[2])
+                                            current_time = hours * 3600 + minutes * 60 + seconds
+                                    except Exception:
+                                        pass
+                                elif line and '-->' not in line and '[' not in line and len(line) > 2:
+                                    transcript.append({
+                                        "text": line,
+                                        "start": current_time,
+                                        "duration": 5.0,
+                                    })
+                            
+                            return transcript if transcript else None
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    
+    return None
+
+
 def transcribe_with_whisper(video_url: str, video_id: str) -> Optional[List[Dict]]:
     """
-    Orchestrate 5-level fallback strategy for transcript extraction.
+    🎯 MASTER TRANSCRIPTION FUNCTION - معالج ذكي للترجمة
     
-    NEVER returns None - always has synthetic content as last resort.
+    استراتيجية صارمة بدون تحميل ملفات (آمن تماماً على Streamlit Cloud):
     
-    Levels (in order):
-    1️⃣ YouTube API (Captions + Auto-Generated)
-    2️⃣ Audio Download + Whisper Transcription (CPU, int8)
-    3️⃣ Piped/Invidious APIs (VTT + plain text parsing)
-    4️⃣ Video Metadata Analysis (title + description → synthetic transcript)
-    5️⃣ Synthetic Content (last resort - never returns None!)
+    1️⃣ YouTube API (الخيار الأول - الأكثر موثوقية)
+    2️⃣ Wayback.tube API (طلب HTTP بسيط - لا تحميل)
+    3️⃣ Yewtu.be API (وسيط Invidious - آمن)
+    4️⃣ Piped/Invidious APIs (VTT parsing)
+    5️⃣ Video Metadata + Synthetic (العنوان والوصف)
+    
+    ⚠️ لا يستخدم ffmpeg أو whisper محلياً
+    ⚠️ NEVER returns None - always provides synthetic content
     """
     
-    # Level 1: YouTube API (most reliable - includes auto-generated!)
+    # Level 1: YouTube API (الخيار الأول - الأكثر موثوقية)
     try:
         transcript = fetch_transcript(video_id, languages=None)
         if transcript and len(transcript) > 0:
@@ -504,90 +540,27 @@ def transcribe_with_whisper(video_url: str, video_id: str) -> Optional[List[Dict
     except Exception:
         pass
     
-    # Level 2: Audio Download + Whisper (robust: direct then proxy fallbacks with real browser UA)
+    # Level 2: Wayback.tube - طلب HTTP آمن بدون تحميل ملفات
     try:
-        audio_path = download_audio_for_transcription(video_url, video_id)
-
-        # If initial download failed, attempt explicit yt-dlp attempts with real Chrome UA
-        if not audio_path:
-            output_template = temp_path(f"whisper_audio_{video_id}.%(ext)s")
-            ua = DEFAULT_USER_AGENT
-            invidious_instances = [
-                "https://yewtu.be",
-                "https://invidious.snopyta.org",
-                "https://invidious.kavin.rocks",
-                "https://vid.puffyan.us",
-                "https://inv.riverside.rocks",
-            ]
-
-            # Try direct URL first, then several invidious proxies to avoid 403s
-            attempt_urls = [video_url] + [f"{inst}/watch?v={video_id}" for inst in invidious_instances]
-
-            for attempt_url in attempt_urls:
-                try:
-                    cmd = [
-                        "yt-dlp",
-                        "-f", "worstaudio/best",
-                        "--extract-audio",
-                        "--audio-format", "m4a",
-                        "--audio-quality", "128K",
-                        "--no-check-certificate",
-                        "--user-agent", ua,
-                        "-o", output_template,
-                        "--quiet",
-                        "--no-warnings",
-                    ]
-                    cmd.append(attempt_url)
-
-                    proc = subprocess.run(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        timeout=90,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    )
-
-                    if proc.returncode == 0:
-                        for ext in ("m4a", "mp3", "wav", "ogg"):
-                            candidate = temp_path(f"whisper_audio_{video_id}.{ext}")
-                            if os.path.exists(candidate) and os.path.getsize(candidate) > 50000:
-                                audio_path = candidate
-                                break
-                    else:
-                        # Store yt-dlp diagnostics for UI
-                        try:
-                            store_yt_dlp_error(proc.stdout, proc.stderr)
-                        except Exception:
-                            pass
-
-                    if audio_path:
-                        break
-                except Exception:
-                    continue
-
-        if audio_path:
-            transcript = transcribe_with_faster_whisper(audio_path)
-            if transcript and len(transcript) > 0:
-                return transcript
-    except Exception:
-        pass
-    
-    # Level 3: Piped/Invidious APIs
-    try:
-        transcript = transcribe_with_piped_api(video_id)
+        transcript = fetch_transcript_from_wayback(video_id)
         if transcript and len(transcript) > 0:
             return transcript
     except Exception:
         pass
     
-    # Level 4: Extract Metadata (title + description)
+    # Level 3: Yewtu.be - وسيط Invidious آمن مع HTTP requests فقط
     try:
-        metadata = extract_video_metadata(video_id)
-        if metadata:
-            transcript = analyze_from_metadata(metadata)
-            if transcript and len(transcript) > 0:
-                return transcript
+        transcript = fetch_transcript_from_yewtu(video_id)
+        if transcript and len(transcript) > 0:
+            return transcript
+    except Exception:
+        pass
+    
+    # Level 4: Piped/Invidious APIs (VTT parsing)
+    try:
+        transcript = transcribe_with_piped_api(video_id)
+        if transcript and len(transcript) > 0:
+            return transcript
     except Exception:
         pass
     
@@ -604,9 +577,47 @@ def transcribe_with_whisper(video_url: str, video_id: str) -> Optional[List[Dict
         except Exception:
             continue
     
-    # ⚠️ ABSOLUTE LAST RESORT: Never return None - app must not crash
+    # Level 6: Extract Metadata (title + description) - الحل الأخير الذكي
+    try:
+        metadata = extract_video_metadata(video_id)
+        if metadata:
+            transcript = analyze_from_metadata(metadata)
+            if transcript and len(transcript) > 0:
+                return transcript
+    except Exception:
+        pass
+    
+    # ⚠️ ABSOLUTE LAST RESORT: Synthetic content from metadata
+    # لا نُرجع None - التطبيق يجب أن يستمر دائماً
+    try:
+        metadata = extract_video_metadata(video_id)
+        if metadata:
+            title = metadata.get("title", "Untitled Video")
+            description = metadata.get("description", "")
+            
+            if title or description:
+                full_text = f"{title}. {description}"
+                sentences = re.split(r'[.!?]', full_text)
+                sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 5]
+                
+                if sentences:
+                    transcript = []
+                    current_time = 0.0
+                    for sentence in sentences[:10]:  # أول 10 جمل
+                        transcript.append({
+                            "text": sentence,
+                            "start": current_time,
+                            "duration": 10.0,
+                        })
+                        current_time += 10.0
+                    
+                    return transcript
+    except Exception:
+        pass
+    
+    # الحل الأخير الأخير - لا نُرجع None أبداً
     return [{
-        "text": "Unable to extract transcript. Using video analysis mode.",
+        "text": "Unable to extract transcript. Using metadata analysis mode.",
         "start": 0.0,
         "duration": 10.0,
     }]
