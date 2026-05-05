@@ -55,27 +55,32 @@ def temp_path(filename: str) -> str:
 
 
 # ============= yt-dlp COMMAND BUILDER (Cloud-Compatible) =============
-def build_yt_dlp_command(url, output_template, format_selector="best[ext=mp4]/best", section_spec=None):
+def build_yt_dlp_command(url: str, output_template: str, format_selector: str = "best", section_spec=None) -> List[str]:
+    # استخراج معرف الفيديو فقط
+    video_id = url.split("v=")[-1].split("?")[0].split("/")[-1]
+    
+    # استخدام رابط وسيط (Invidious Instance) لتجاوز حظر Streamlit
+    # هذا الرابط يعمل كبروكسي مجاني
+    proxy_url = f"https://inv.tux.rs/latest/video?v={video_id}"
+    
     cmd = [
         "yt-dlp",
-        "-f", "best[height<=720][ext=mp4]", # تحديد جودة متوسطة لتقليل الحظر
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "--no-check-certificate",
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "-o", output_template,
-        # استخدام Web Embedded يتجاوز طلب الـ PO Token في كثير من الأحيان
-        "--extractor-args", "youtube:player_client=web_embedded,mweb;player_params=sig",
-        "--force-ipv4",
-        "--geo-bypass", # محاولة تخطي القيود الجغرافية
+        "--geo-bypass",
     ]
     
-    # استخدام الكوكيز ضروري جداً هنا
-    if os.path.exists("cookies.txt"):
-        cmd.extend(["--cookies", "cookies.txt"])
-    
+    # إذا كان هناك قص للمقاطع، نستخدم الرابط الأصلي مع الكوكيز كخيار ثانٍ
+    # لكن للتحميل المباشر، نستخدم البروكسي
     if section_spec:
         cmd.extend(["--download-sections", section_spec, "--force-keyframes-at-cuts"])
+        cmd.append(url)
+        if os.path.exists("cookies.txt"):
+            cmd.extend(["--cookies", "cookies.txt"])
+    else:
+        cmd.append(proxy_url)
         
-    cmd.append(url)
     return cmd
 
 def tail_text(output_text: str, max_lines: int = 20) -> str:
