@@ -10,6 +10,7 @@ GitHub Education Partner | AI Intelligence Engine
 ================================================================================
 """
 import random
+import requests
 import re
 import json
 import os
