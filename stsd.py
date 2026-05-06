@@ -1720,79 +1720,113 @@ def read_essential_youtube_cookies() -> str:
     return "; ".join([f"{name}={cookie_map[name]}" for name in ordered_names if name in cookie_map])
 
 
+def load_requests_cookies_from_file() -> Dict[str, str]:
+    """
+    Load Netscape cookies.txt into a requests-compatible cookie dict.
+    """
+    cookies_path = app_path("cookies.txt")
+    if not os.path.exists(cookies_path):
+        return {}
+
+    cookie_dict: Dict[str, str] = {}
+    try:
+        with open(cookies_path, "r", encoding="utf-8", errors="ignore") as cookie_file:
+            for raw_line in cookie_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    name = parts[5].strip()
+                    value = parts[6].strip()
+                    if name:
+                        cookie_dict[name] = value
+    except Exception:
+        return {}
+    return cookie_dict
+
+
 def stream_clip_with_ytdlp_to_memory(
     video_url: str,
     start_time: float,
     end_time: float,
 ) -> Tuple[bool, Optional[io.BytesIO], str]:
     """
-    Primary strategy: yt-dlp download-sections to temp file, then BytesIO.
+    Primary strategy:
+    1) yt-dlp extracts direct stream URL
+    2) requests streams bytes as proxy
+    3) ffmpeg receives bytes via stdin (pipe:0) and outputs clipped mp4 to stdout (pipe:1)
     """
     start_value = max(0.0, float(start_time))
     end_value = max(start_value + 1.0, float(end_time))
-    section_spec = f"*{format_hhmmss(start_value)}-{format_hhmmss(end_value)}"
-    temp_output_path = Path("/tmp/final_clip.mp4")
-    if not temp_output_path.parent.exists():
-        temp_output_path = Path(temp_path("final_clip.mp4"))
-    output_file = str(temp_output_path)
+    duration_value = end_value - start_value
 
-    try:
-        if os.path.exists(output_file):
-            os.remove(output_file)
-    except Exception:
-        pass
+    ok_url, direct_or_error = get_direct_stream_url(video_url)
+    if not ok_url:
+        return False, None, direct_or_error
+    direct_url = direct_or_error
 
-    cmd = [
-        "yt-dlp",
-        "--no-check-certificate",
-        "--quiet",
-        "--no-warnings",
-        "--no-progress",
-        "--extractor-args", "youtube:player_client=android_vr,web_safari",
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "--download-sections", section_spec,
-        "--force-overwrites",
-        "-f", "best[ext=mp4]/best",
-        "-o", output_file,
-        video_url,
+    cookies = load_requests_cookies_from_file()
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Referer": "https://www.youtube.com/",
+    }
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-i", "pipe:0",
+        "-ss", str(start_value),
+        "-t", str(duration_value),
+        "-c", "copy",
+        "-f", "mp4",
+        "pipe:1",
     ]
-    cookies_path = app_path("cookies.txt")
-    if os.path.exists(cookies_path):
-        cmd[1:1] = ["--cookies", cookies_path]
-
-    # Re-read cookies path before every request to keep credentials fresh.
     try:
-        proc = subprocess.run(
-            cmd,
-            stderr=subprocess.PIPE,
+        ffmpeg_proc = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            timeout=300,
+            stderr=subprocess.PIPE,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+    except FileNotFoundError:
+        return False, None, "ffmpeg غير مثبت أو غير موجود في PATH."
     except Exception as exc:
-        return False, None, f"فشل تشغيل yt-dlp: {exc}"
-
-    if proc.returncode != 0:
-        ytdlp_tail = tail_text((proc.stderr or b"").decode("utf-8", errors="ignore"), max_lines=20)
-        return False, None, f"فشل yt-dlp أثناء قص المقطع: {ytdlp_tail or 'Unknown error'}"
-
-    if not os.path.exists(output_file):
-        return False, None, "yt-dlp انتهى لكن لم يُنشئ الملف المؤقت."
-    if os.path.getsize(output_file) <= 0:
-        return False, None, "الملف المؤقت الناتج فارغ."
+        return False, None, f"فشل تشغيل FFmpeg: {exc}"
 
     try:
-        with open(output_file, "rb") as generated_clip:
-            clip_bytes = generated_clip.read()
+        with requests.get(direct_url, stream=True, headers=headers, cookies=cookies, timeout=120) as response:
+            response.raise_for_status()
+            if ffmpeg_proc.stdin is None:
+                ffmpeg_proc.kill()
+                return False, None, "تعذر فتح stdin لـ FFmpeg."
+            for chunk in response.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    ffmpeg_proc.stdin.write(chunk)
+        ffmpeg_proc.stdin.close()
+        clip_stdout, clip_stderr = ffmpeg_proc.communicate(timeout=240)
+    except requests.RequestException as exc:
+        ffmpeg_proc.kill()
+        return False, None, f"فشل التحميل عبر requests: {exc}"
+    except BrokenPipeError:
+        ffmpeg_proc.kill()
+        return False, None, "انقطع مسار FFmpeg أثناء ضخ البيانات."
+    except subprocess.TimeoutExpired:
+        ffmpeg_proc.kill()
+        clip_stdout, clip_stderr = ffmpeg_proc.communicate()
+        ffmpeg_tail = tail_text((clip_stderr or b"").decode("utf-8", errors="ignore"), max_lines=20)
+        return False, None, f"انتهت مهلة FFmpeg: {ffmpeg_tail or 'Timeout'}"
     except Exception as exc:
-        return False, None, f"تعذر قراءة الملف المؤقت: {exc}"
-    finally:
-        try:
-            os.remove(output_file)
-        except Exception:
-            pass
+        ffmpeg_proc.kill()
+        return False, None, f"فشل مسار requests->ffmpeg: {exc}"
 
-    clip_buffer = io.BytesIO(clip_bytes)
+    if ffmpeg_proc.returncode != 0:
+        ffmpeg_tail = tail_text((clip_stderr or b"").decode("utf-8", errors="ignore"), max_lines=20)
+        return False, None, f"فشل FFmpeg أثناء القص: {ffmpeg_tail or 'Unknown error'}"
+    if not clip_stdout:
+        return False, None, "FFmpeg لم يرجع بيانات MP4."
+
+    clip_buffer = io.BytesIO(clip_stdout)
     clip_buffer.seek(0)
     return True, clip_buffer, ""
 
@@ -2115,17 +2149,48 @@ def render_stage_3():
     start_seconds = max(0, int(start_time))
     end_seconds = max(start_seconds + 1, int(end_time))
 
-    quoted_video_url = quote_plus(video_url)
-    dirpy_link = f"https://dirpy.com/from/youtube?url={quoted_video_url}&start={start_seconds}&end={end_seconds}"
-    ytcutter_link = f"https://ytcutter.com/?url={quoted_video_url}&start={start_seconds}&end={end_seconds}"
-
-    st.warning("📥 السيرفر الحالي محظور من يوتيوب، اضغط هنا لفتح المقطع المقصوص جاهزاً للتحميل في ثوانٍ.")
-    st.markdown(f"[🚀 فتح المقطع مباشرة عبر Dirpy]({dirpy_link})")
-    st.markdown(f"[✂️ بديل سريع عبر YTCutter]({ytcutter_link})")
-
+    st.info("⚡ سيتم القص عبر Stream مباشر: yt-dlp + requests + ffmpeg pipe.")
     st.markdown("### 🎬 معاينة داخل الصفحة")
-    st.markdown("**شاهد اللقطة المختارة هنا، وللتحميل استخدم الزر أعلاه.**")
-    st.video(f"https://www.youtube.com/embed/{video_id}?start={start_seconds}&end={end_seconds}&autoplay=0")
+    st.video(f"{video_url}&t={start_seconds}s")
+
+    if "stage3_clip_bytes" not in st.session_state:
+        st.session_state.stage3_clip_bytes = None
+    if "stage3_clip_filename" not in st.session_state:
+        st.session_state.stage3_clip_filename = None
+    if "stage3_clip_key" not in st.session_state:
+        st.session_state.stage3_clip_key = None
+
+    clip_key = f"{video_id}:{start_seconds}:{end_seconds}:{selected_quality}"
+    if st.session_state.stage3_clip_key != clip_key:
+        st.session_state.stage3_clip_key = clip_key
+        st.session_state.stage3_clip_bytes = None
+        st.session_state.stage3_clip_filename = None
+
+    st.markdown("### 📥 تحميل MP4 (Direct Stream Proxy)")
+    if st.button("⚡ جهّز القص المباشر للتحميل", use_container_width=True):
+        with st.spinner("جاري سحب الستريم عبر requests ثم قصه بـ FFmpeg في الذاكرة..."):
+            ok_clip, clip_buffer, clip_error = stream_clip_with_ytdlp_to_memory(
+                video_url=video_url,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            if not ok_clip or clip_buffer is None:
+                st.error(clip_error or "فشل تجهيز المقطع.")
+            else:
+                st.session_state.stage3_clip_bytes = clip_buffer.getvalue()
+                st.session_state.stage3_clip_filename = f"viral_clip_{video_id}_{start_seconds}_{end_seconds}.mp4"
+                st.success("✅ المقطع جاهز. اضغط زر التحميل الآن.")
+
+    if st.session_state.stage3_clip_bytes:
+        st.markdown("### ▶️ معاينة المقطع الناتج")
+        st.video(st.session_state.stage3_clip_bytes)
+        st.download_button(
+            label="⬇️ تنزيل المقطع الآن",
+            data=io.BytesIO(st.session_state.stage3_clip_bytes),
+            file_name=st.session_state.stage3_clip_filename or "viral_clip.mp4",
+            mime="video/mp4",
+            use_container_width=True,
+        )
 
     st.caption(f"توقيت اللقطة المقترح: من {start_seconds}s إلى {end_seconds}s | الجودة المختارة: {selected_quality} | مدة القص: {int(clip_duration)}s")
 
