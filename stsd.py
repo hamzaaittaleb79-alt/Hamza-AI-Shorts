@@ -1672,35 +1672,6 @@ def get_direct_stream_url(video_url: str) -> Tuple[bool, str]:
     return True, candidates[0]
 
 
-def read_cookies_for_ffmpeg_header() -> str:
-    """
-    Read cookies.txt and convert it to a Cookie header string for FFmpeg.
-    Supports Netscape cookie file format.
-    """
-    cookies_path = app_path("cookies.txt")
-    if not os.path.exists(cookies_path):
-        return ""
-
-    cookie_pairs: List[str] = []
-    try:
-        with open(cookies_path, "r", encoding="utf-8", errors="ignore") as cookie_file:
-            for raw_line in cookie_file:
-                line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split("\t")
-                # Netscape format: domain, flag, path, secure, expiry, name, value
-                if len(parts) >= 7:
-                    name = parts[5].strip()
-                    value = parts[6].strip()
-                    if name:
-                        cookie_pairs.append(f"{name}={value}")
-    except Exception:
-        return ""
-
-    return "; ".join(cookie_pairs)
-
-
 def cut_direct_stream_to_memory(
     direct_url: str,
     start_time: float,
@@ -1712,19 +1683,22 @@ def cut_direct_stream_to_memory(
     if duration <= 0:
         return False, None, "مدة القص غير صالحة."
 
-    cookies_content = read_cookies_for_ffmpeg_header()
-    ffmpeg_headers = f"User-Agent: {DEFAULT_USER_AGENT}\r\nCookie: {cookies_content}\r\n"
+    cookies_path = app_path("cookies.txt")
 
     cmd = [
         "ffmpeg",
-        "-headers", ffmpeg_headers,
+        "-user_agent", DEFAULT_USER_AGENT,
         "-ss", str(max(0.0, float(start_time))),
-        "-i", direct_url,  # IMPORTANT: -headers is intentionally placed before -i
+    ]
+    if os.path.exists(cookies_path):
+        cmd.extend(["-cookies_file", cookies_path])
+    cmd.extend([
+        "-i", direct_url,  # IMPORTANT: options are intentionally placed before -i
         "-t", str(float(duration)),
         "-c", "copy",
         "-f", "mp4",
         "pipe:1",
-    ]
+    ])
 
     try:
         proc = subprocess.run(
