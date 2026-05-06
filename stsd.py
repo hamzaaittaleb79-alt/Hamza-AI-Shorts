@@ -207,7 +207,7 @@ def get_transcript_smart(video_id: str) -> Optional[List[Dict]]:
     Lightweight cloud-based transcript fetcher.
 
     Attempts to get any available transcript using youtube_transcript_api,
-    then falls back to proxy caption endpoints, then synthetic text.
+    then falls back to proxy caption endpoints.
     """
     try:
         cookies_path = app_path("cookies.txt")
@@ -253,22 +253,7 @@ def get_transcript_smart(video_id: str) -> Optional[List[Dict]]:
     if proxy_transcript:
         return proxy_transcript
 
-    video_title = "Untitled Video"
-    try:
-        oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
-        response = requests.get(oembed_url, timeout=8, headers={"User-Agent": DEFAULT_USER_AGENT})
-        if response.status_code == 200:
-            video_title = response.json().get("title", video_title).strip() or video_title
-    except Exception:
-        pass
-
-    return [
-        {"text": f"{video_title} - intro hook", "start": 0.0, "duration": 5.0},
-        {"text": f"{video_title} - key point one", "start": 5.0, "duration": 5.0},
-        {"text": f"{video_title} - key point two", "start": 10.0, "duration": 5.0},
-        {"text": f"{video_title} - key point three", "start": 15.0, "duration": 5.0},
-        {"text": f"{video_title} - closing thought", "start": 20.0, "duration": 5.0},
-    ]
+    return None
 
 
 # ============= PAGE CONFIG & STYLING =============
@@ -985,25 +970,26 @@ def render_stage_1():
                             # Step 1: Use cloud-smart transcript fetcher (youtube_transcript_api only)
                             st.write("📌 Fetching transcript via smart cloud engine...")
                             transcript = get_transcript_smart(video_id)
-                            st.write(f"DEBUG: Transcript length: {len(transcript)}")
-                            st.session_state.transcript = transcript
-                            st.session_state.transcript_text = format_transcript(transcript, show_timestamps=True)
-                            st.session_state.viral_moments = analyze_with_ai(
-                                transcript,
-                                custom_keywords=parse_custom_keywords(st.session_state.custom_keywords) if st.session_state.use_custom_keywords else None,
-                                top_n=3,
-                            )
-                            
-                            if transcript and len(transcript) > 0:
+                            transcript_length = len(transcript) if transcript else 0
+                            st.write(f"DEBUG: Transcript length: {transcript_length}")
+
+                            if not transcript or len(transcript) == 0:
+                                status_placeholder.update(label="❌ No transcript available", state="error")
+                                st.error("❌ Could not extract a real transcript. Try a different video or enable cookies/proxy access.")
+                            else:
                                 st.write(f"✅ Successfully fetched {len(transcript)} transcript segments!")
                                 st.session_state.video_id = video_id
                                 st.session_state.video_url = video_url
+                                st.session_state.transcript = transcript
+                                st.session_state.transcript_text = format_transcript(transcript, show_timestamps=True)
+                                st.session_state.viral_moments = analyze_with_ai(
+                                    transcript,
+                                    custom_keywords=parse_custom_keywords(st.session_state.custom_keywords) if st.session_state.use_custom_keywords else None,
+                                    top_n=3,
+                                )
                                 status_placeholder.update(label="✅ Transcript loaded!", state="complete")
                                 st.session_state.stage = 2
                                 st.rerun()
-                            else:
-                                status_placeholder.update(label="❌ No transcript available", state="error")
-                                st.error("❌ Critical Error: Could not analyze video at all")
                     except Exception as e:
                         status_placeholder.update(label="❌ Error", state="error")
                         st.error(f"❌ Unexpected error: {str(e)}")
