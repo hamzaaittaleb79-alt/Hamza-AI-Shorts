@@ -116,6 +116,108 @@ def _normalize_transcript_segments(raw_segments: List[Dict]) -> List[Dict]:
     return normalized
 
 
+def _parse_vtt_to_segments(vtt_text: str) -> List[Dict]:
+    """Parse VTT subtitle text into transcript segments."""
+    def parse_vtt_timestamp(ts: str) -> float:
+        ts = ts.replace(",", ".").strip()
+        parts = ts.split(":")
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        return float(parts[0])
+
+    transcript = []
+    current_start = 0.0
+    current_end = 5.0
+
+    for raw_line in (vtt_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(("WEBVTT", "NOTE", "STYLE", "REGION")):
+            continue
+        if "-->" in line:
+            try:
+                start_str, end_str = [part.strip() for part in line.split("-->", 1)]
+                current_start = parse_vtt_timestamp(start_str.split(" ")[0])
+                current_end = parse_vtt_timestamp(end_str.split(" ")[0])
+            except Exception:
+                current_end = current_start + 5.0
+            continue
+
+        if line.isdigit():
+            continue
+
+        clean_text = re.sub(r"<[^>]+>", "", line).strip()
+        if not clean_text:
+            continue
+
+        transcript.append({
+            "text": clean_text,
+            "start": current_start,
+            "duration": max(0.5, current_end - current_start),
+        })
+
+    return transcript
+
+
+def _fetch_transcript_with_ytdlp(video_id: str) -> Optional[List[Dict]]:
+    """Scout attempt: fetch auto subtitles with yt-dlp, then parse temp subtitle files."""
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    output_template = temp_path(f"yt_subs_{video_id}.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "--skip-download",
+        "--write-auto-subs",
+        "--get-subs",
+        "--sub-langs", "all,-live_chat",
+        "--sub-format", "vtt",
+        "--no-check-certificate",
+        "--user-agent", DEFAULT_USER_AGENT,
+        "-o", output_template,
+        video_url,
+    ]
+
+    try:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=45,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        return None
+
+    subtitle_files = sorted(TEMP_DIR.glob(f"yt_subs_{video_id}*.vtt"))
+    if not subtitle_files:
+        return None
+
+    selected_file = None
+    for file_path in subtitle_files:
+        lower_name = file_path.name.lower()
+        if ".en." in lower_name or ".ar." in lower_name or ".fr." in lower_name:
+            selected_file = file_path
+            break
+    if selected_file is None:
+        selected_file = subtitle_files[0]
+
+    try:
+        content = selected_file.read_text(encoding="utf-8", errors="ignore")
+        transcript = _parse_vtt_to_segments(content)
+        return transcript if transcript else None
+    except Exception:
+        return None
+    finally:
+        for file_path in subtitle_files:
+            try:
+                file_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 def _fetch_transcript_from_proxy(video_id: str) -> Optional[List[Dict]]:
     """Try lightweight proxy caption endpoints when direct YouTube transcript lookup fails."""
     proxy_endpoints = [
@@ -263,18 +365,33 @@ def _metadata_description_as_transcript(video_id: str) -> Optional[List[Dict]]:
         return None
 
 
-def get_transcript_smart(video_id: str) -> Optional[List[Dict]]:
+def _get_transcript_smart_result(video_id: str) -> Tuple[Optional[List[Dict]], str]:
     """
     Lightweight cloud-based transcript fetcher.
 
-    Attempts to get any available transcript using youtube_transcript_api,
-    then falls back to proxy caption endpoints.
+    Strict order:
+    1) yt-dlp auto subtitles
+    2) Proxy captions endpoints
+    3) Video description fallback
     """
+    ytdlp_transcript = _fetch_transcript_with_ytdlp(video_id)
+    if ytdlp_transcript:
+        return ytdlp_transcript, "ytdlp_subtitles"
+
     proxy_transcript = _fetch_transcript_from_proxy(video_id)
     if proxy_transcript:
-        return proxy_transcript
+        return proxy_transcript, "proxy_captions"
 
-    return _metadata_description_as_transcript(video_id)
+    description_transcript = _metadata_description_as_transcript(video_id)
+    if description_transcript:
+        return description_transcript, "description_backup"
+
+    return None, "none"
+
+
+def get_transcript_smart(video_id: str) -> Optional[List[Dict]]:
+    transcript, _source = _get_transcript_smart_result(video_id)
+    return transcript
 
 
 # ============= PAGE CONFIG & STYLING =============
@@ -428,6 +545,7 @@ def init_session_state():
         "aspect_ratio": "9:16",
         "history": [],
         "languages": ["en"],
+        "transcript_source": None,
         "custom_keywords": "",
         "use_custom_keywords": False,
         "transcription_status": None,
@@ -988,9 +1106,9 @@ def render_stage_1():
                     
                     try:
                         with status_placeholder:
-                            # Step 1: Use cloud-smart transcript fetcher (youtube_transcript_api only)
+                            # Step 1: Strict transcript pipeline (yt-dlp -> proxy -> description)
                             st.write("جاري التحليل عبر المحرك البديل...")
-                            transcript = get_transcript_smart(video_id)
+                            transcript, transcript_source = _get_transcript_smart_result(video_id)
 
                             if not transcript or len(transcript) == 0:
                                 status_placeholder.update(label="⚠️ No transcript available", state="error")
@@ -1000,6 +1118,7 @@ def render_stage_1():
                                 st.session_state.video_id = video_id
                                 st.session_state.video_url = video_url
                                 st.session_state.transcript = transcript
+                                st.session_state.transcript_source = transcript_source
                                 st.session_state.transcript_text = format_transcript(transcript, show_timestamps=True)
                                 st.session_state.viral_moments = analyze_with_ai(
                                     transcript,
