@@ -1726,16 +1726,14 @@ def stream_clip_with_ytdlp_to_memory(
     end_time: float,
 ) -> Tuple[bool, Optional[io.BytesIO], str]:
     """
-    Primary strategy: yt-dlp + external ffmpeg clip into temp file, then BytesIO.
+    Primary strategy: yt-dlp download-sections to temp file, then BytesIO.
     """
     start_value = max(0.0, float(start_time))
     end_value = max(start_value + 1.0, float(end_time))
-    duration_value = end_value - start_value
     section_spec = f"*{format_hhmmss(start_value)}-{format_hhmmss(end_value)}"
-    downloader_args = f"ffmpeg:-ss {format_hhmmss(start_value)} -t {format_hhmmss(duration_value)} -c copy"
-    temp_output_path = Path("/tmp/temp_clip.mp4")
+    temp_output_path = Path("/tmp/final_clip.mp4")
     if not temp_output_path.parent.exists():
-        temp_output_path = Path(temp_path("temp_clip.mp4"))
+        temp_output_path = Path(temp_path("final_clip.mp4"))
     output_file = str(temp_output_path)
 
     try:
@@ -1750,11 +1748,9 @@ def stream_clip_with_ytdlp_to_memory(
         "--quiet",
         "--no-warnings",
         "--no-progress",
-        "--client-name", "android_vr",
+        "--extractor-args", "youtube:player_client=android_vr,web_safari",
         "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "--download-sections", section_spec,
-        "--external-downloader", "ffmpeg",
-        "--downloader-args", downloader_args,
         "--force-overwrites",
         "-f", "best[ext=mp4]/best",
         "-o", output_file,
@@ -1764,6 +1760,7 @@ def stream_clip_with_ytdlp_to_memory(
     if os.path.exists(cookies_path):
         cmd[1:1] = ["--cookies", cookies_path]
 
+    # Re-read cookies path before every request to keep credentials fresh.
     try:
         proc = subprocess.run(
             cmd,
@@ -2151,6 +2148,8 @@ def render_stage_3():
                 st.success("✅ المقطع جاهز. اضغط زر التحميل الآن.")
 
     if st.session_state.stage3_clip_bytes:
+        st.markdown("### ▶️ معاينة المقطع الناتج")
+        st.video(st.session_state.stage3_clip_bytes)
         st.download_button(
             label="⬇️ تنزيل المقطع الآن",
             data=io.BytesIO(st.session_state.stage3_clip_bytes),
