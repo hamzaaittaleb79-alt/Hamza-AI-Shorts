@@ -108,10 +108,11 @@ def get_random_user_agent() -> str:
 
 
 COBALT_INSTANCES = [
+    "https://cobalt.api.unblocker.it",
+    "https://cobalt-api.kwiatekmiki.gq",
     "https://api.cobalt.tools",
     "https://cobalt.api.timothymiller.dev",
     "https://api.cobalt.wtf",
-    "https://cobalt-service.azurewebsites.net",
 ]
 
 def get_cobalt_instances_list() -> List[str]:
@@ -1464,12 +1465,12 @@ def create_viral_short(
     status_placeholder = None,
 ) -> Optional[str]:
     """
-    Extract direct streaming URL only (no server-side download/cutting).
+    Get clipped streaming URL from Cobalt instances (no local file download).
 
     Strategy:
-    1. Use yt-dlp --get-url to fetch raw GoogleVideo URL
-    2. Keep cookies + real User-Agent + referer for fewer 403s
-    3. Return direct URL to let user download from their own device IP
+    1. Try multiple public Cobalt instances in sequence
+    2. Send sectionStart/sectionEnd so server performs clipping
+    3. Accept first successful response with status=stream and url
     """
     start_seconds = max(0.0, float(start_time))
     duration = max(0.0, float(end_time) - float(start_time))
@@ -1478,60 +1479,80 @@ def create_viral_short(
             status_placeholder.error("❌ Invalid duration")
         return None
 
-    video_id = extract_video_id(video_url) or "video"
-    cookies_path = app_path("cookies.txt")
-    input_url = video_url if video_url.startswith("http") else f"https://www.youtube.com/watch?v={video_id}"
-    format_selector = "best[height<=720][ext=mp4]/best"
+    quality_level = 720
     quality_text = str(quality or "")
     if "1080" in quality_text:
-        format_selector = "best[height<=1080][ext=mp4]/best"
+        quality_level = 1080
     elif "480" in quality_text:
-        format_selector = "best[height<=480][ext=mp4]/best"
+        quality_level = 480
 
-    cmd = [
-        "yt-dlp",
-        "--get-url",
-        "--no-check-certificate",
-        "--user-agent", DEFAULT_USER_AGENT,
-        "--referer", "https://www.youtube.com/",
-        "-f", format_selector,
-        input_url,
-    ]
-    if os.path.exists(cookies_path):
-        cmd[1:1] = ["--cookies", cookies_path]
+    payload = {
+        "url": video_url,
+        "videoQuality": quality_level,
+        "downloadMode": "auto",
+        "filenameStyle": "nerdy",
+        "isNoAudio": False,
+        "sectionStart": round(start_seconds, 3),
+        "sectionEnd": round(start_seconds + duration, 3),
+    }
 
     if status_placeholder:
-        status_placeholder.info("🔗 جارٍ استخراج رابط التحميل المباشر...")
+        status_placeholder.info("🧩 تجربة سيرفرات Cobalt لاستخراج الرابط المقصوص...")
 
-    try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=90,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except Exception as e:
-        if status_placeholder:
-            status_placeholder.error(f"❌ فشل استخراج الرابط: {e}")
-        return None
+    def extract_stream_payload(api_data: Any) -> Tuple[Optional[str], Optional[str]]:
+        if isinstance(api_data, dict):
+            status_value = str(api_data.get("status", "")).lower()
+            for key in ("url", "download", "stream", "streamUrl", "link"):
+                value = api_data.get(key)
+                if isinstance(value, str) and value.startswith("http"):
+                    return value, status_value
+            for nested_key in ("data", "result"):
+                nested = api_data.get(nested_key)
+                nested_url, nested_status = extract_stream_payload(nested)
+                if nested_url:
+                    return nested_url, nested_status or status_value
+            for list_key in ("links", "files"):
+                items = api_data.get(list_key)
+                if isinstance(items, list):
+                    for item in items:
+                        nested_url, nested_status = extract_stream_payload(item)
+                        if nested_url:
+                            return nested_url, nested_status or status_value
+        elif isinstance(api_data, list):
+            for item in api_data:
+                nested_url, nested_status = extract_stream_payload(item)
+                if nested_url:
+                    return nested_url, nested_status
+        return None, None
 
-    if proc.returncode != 0:
-        error_tail = store_yt_dlp_error(proc.stdout, proc.stderr)
-        if status_placeholder:
-            status_placeholder.error("❌ تعذر استخراج الرابط المباشر من yt-dlp.")
-        st.session_state.last_yt_dlp_error = error_tail
-        return None
-
-    stream_candidates = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip().startswith("http")]
-    direct_url = stream_candidates[0] if stream_candidates else ""
-    if not direct_url:
-        return None
+    for instance in COBALT_INSTANCES:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Referer": "https://cobalt.tools/",
+        }
+        try:
+            response = requests.post(
+                f"{instance}/api/json",
+                json=payload,
+                headers=headers,
+                timeout=25,
+            )
+            if response.status_code >= 400:
+                continue
+            data = response.json()
+            stream_url, stream_status = extract_stream_payload(data)
+            if stream_url and stream_status == "stream":
+                if status_placeholder:
+                    status_placeholder.success(f"✅ تم الاعتماد على: {instance}")
+                return stream_url
+        except Exception:
+            continue
 
     if progress_placeholder:
-        progress_placeholder.success("✅ Direct link extracted")
-    return direct_url
+        progress_placeholder.error("❌ Failed to obtain clipped stream URL.")
+    return None
 
 
 # ============= STAGE 1: INPUT & ANALYSIS =============
@@ -1785,10 +1806,10 @@ def render_stage_3():
     }
     selected_quality = quality_map[quality_choice]
 
-    st.markdown("### 🔗 استخراج الرابط")
-    if st.button("🔗 استخراج رابط التحميل", use_container_width=True, type="primary", key="clip_now"):
+    st.markdown("### 🔗 استخراج رابط الفيديو المقصوص")
+    if st.button("🔗 تجهيز فيديو اللقطة", use_container_width=True, type="primary", key="clip_now"):
         status_placeholder = st.empty()
-        with st.spinner("جاري تجهيز رابط التحميل المباشر..."):
+        with st.spinner("جاري توليد رابط اللقطة من سيرفرات Cobalt..."):
             direct_url = create_viral_short(
                 video_url=video_url,
                 start_time=float(selected.get("start_time", 0.0)),
@@ -1800,19 +1821,17 @@ def render_stage_3():
 
         if direct_url:
             st.session_state.download_link = direct_url
-            st.success("✅ تم استخراج رابط التحميل المباشر!")
+            st.success("✅ تم استخراج رابط الفيديو المقصوص بنجاح!")
         else:
             st.session_state.download_link = None
-            st.error("❌ فشل استخراج الرابط. يمكنك المحاولة مجددًا.")
+            st.error("❌ لم ينجح أي سيرفر Cobalt حالياً. حاول مرة أخرى.")
 
     direct_link = st.session_state.get("download_link")
     if direct_link:
         st.markdown("---")
-        st.markdown("### 📌 تعليمات القص للمستخدم")
-        st.info(
-            f"ابدأ التحميل/القص من التوقيت: {selected.get('timestamp', '00:00')} "
-            f"ولمدة تقريبية {int(max(1, float(selected.get('end_time', 45.0)) - float(selected.get('start_time', 0.0))))} ثانية."
-        )
+        st.markdown("### 🎬 معاينة اللقطة مباشرة")
+        st.video(direct_link)
+        st.markdown("### 📌 التحميل")
         st.link_button(
             "📥 اضغط هنا للتحميل المباشر من جهازك",
             url=direct_link,
@@ -1820,18 +1839,6 @@ def render_stage_3():
         )
         st.markdown("أو انسخ الرابط يدويًا:")
         st.code(direct_link, language="text")
-
-        cobalt_ok, cobalt_link = get_cobalt_direct_download_link(
-            video_url=video_url,
-            quality_level=1080 if "1080" in selected_quality else (480 if "480" in selected_quality else 720),
-            status_placeholder=None,
-        )
-        if cobalt_ok and cobalt_link:
-            st.link_button(
-                "⚡ بديل سريع عبر Cobalt",
-                url=cobalt_link,
-                use_container_width=True,
-            )
 
 
 # ============= MAIN APP FLOW =============
