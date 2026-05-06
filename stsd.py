@@ -1672,10 +1672,104 @@ def get_direct_stream_url(video_url: str) -> Tuple[bool, str]:
     return True, candidates[0]
 
 
+def read_essential_youtube_cookies() -> str:
+    """
+    Extract only essential YouTube cookies from Netscape cookies.txt.
+    """
+    cookies_path = app_path("cookies.txt")
+    if not os.path.exists(cookies_path):
+        return ""
+
+    required_names = {
+        "VISITOR_INFO1_LIVE",
+        "HSID",
+        "SSID",
+        "APISID",
+        "SAPISID",
+        "LOGIN_INFO",
+        "__Secure-3PSID",
+        "__Secure-3PAPISID",
+    }
+    cookie_map: Dict[str, str] = {}
+    try:
+        with open(cookies_path, "r", encoding="utf-8", errors="ignore") as cookie_file:
+            for raw_line in cookie_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 7:
+                    continue
+                name = parts[5].strip()
+                value = parts[6].strip()
+                if name in required_names and value:
+                    cookie_map[name] = value
+    except Exception:
+        return ""
+
+    ordered_names = [
+        "VISITOR_INFO1_LIVE",
+        "HSID",
+        "SSID",
+        "APISID",
+        "SAPISID",
+        "LOGIN_INFO",
+        "__Secure-3PSID",
+        "__Secure-3PAPISID",
+    ]
+    return "; ".join([f"{name}={cookie_map[name]}" for name in ordered_names if name in cookie_map])
+
+
+def cut_with_ytdlp_fallback_to_memory(
+    video_url: str,
+    start_time: float,
+    duration: float,
+) -> Tuple[bool, Optional[io.BytesIO], str]:
+    """
+    Fallback: clip via yt-dlp and stream bytes from stdout.
+    """
+    section_spec = f"*{format_hhmmss(start_time)}-{format_hhmmss(start_time + duration)}"
+    cmd = [
+        "yt-dlp",
+        "--no-check-certificate",
+        "--user-agent", DEFAULT_USER_AGENT,
+        "--download-sections", section_spec,
+        "--force-keyframes-at-cuts",
+        "-f", "best[ext=mp4]/best",
+        "-o", "-",
+        video_url,
+    ]
+    cookies_path = app_path("cookies.txt")
+    if os.path.exists(cookies_path):
+        cmd[1:1] = ["--cookies", cookies_path]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=240,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        return False, None, f"فشل fallback عبر yt-dlp: {exc}"
+
+    if proc.returncode != 0:
+        ytdlp_tail = tail_text(proc.stderr.decode("utf-8", errors="ignore"), max_lines=20)
+        return False, None, f"فشل fallback عبر yt-dlp: {ytdlp_tail or 'Unknown error'}"
+    if not proc.stdout:
+        return False, None, "yt-dlp fallback لم يرجع بيانات MP4."
+
+    fallback_buffer = io.BytesIO(proc.stdout)
+    fallback_buffer.seek(0)
+    return True, fallback_buffer, ""
+
+
 def cut_direct_stream_to_memory(
     direct_url: str,
     start_time: float,
     duration: float,
+    source_video_url: Optional[str] = None,
 ) -> Tuple[bool, Optional[io.BytesIO], str]:
     """
     Clip direct stream URL in-memory using FFmpeg pipe output.
@@ -1683,22 +1777,19 @@ def cut_direct_stream_to_memory(
     if duration <= 0:
         return False, None, "مدة القص غير صالحة."
 
-    cookies_path = app_path("cookies.txt")
+    cleaned_cookies = read_essential_youtube_cookies()
+    ffmpeg_headers = f"Cookie: {cleaned_cookies}\r\nUser-Agent: {DEFAULT_USER_AGENT}\r\n"
 
     cmd = [
         "ffmpeg",
-        "-user_agent", DEFAULT_USER_AGENT,
+        "-headers", ffmpeg_headers,
         "-ss", str(max(0.0, float(start_time))),
-    ]
-    if os.path.exists(cookies_path):
-        cmd.extend(["-cookies_file", cookies_path])
-    cmd.extend([
-        "-i", direct_url,  # IMPORTANT: options are intentionally placed before -i
+        "-i", direct_url,
         "-t", str(float(duration)),
         "-c", "copy",
         "-f", "mp4",
         "pipe:1",
-    ])
+    ]
 
     try:
         proc = subprocess.run(
@@ -1715,6 +1806,16 @@ def cut_direct_stream_to_memory(
 
     if proc.returncode != 0:
         ffmpeg_tail = tail_text(proc.stderr.decode("utf-8", errors="ignore"), max_lines=20)
+        if source_video_url:
+            fallback_ok, fallback_buffer, fallback_error = cut_with_ytdlp_fallback_to_memory(
+                video_url=source_video_url,
+                start_time=max(0.0, float(start_time)),
+                duration=float(duration),
+            )
+            if fallback_ok and fallback_buffer is not None:
+                fallback_buffer.seek(0)
+                return True, fallback_buffer, ""
+            return False, None, f"فشل FFmpeg ثم fallback yt-dlp: {fallback_error}"
         return False, None, f"فشل FFmpeg أثناء القص: {ffmpeg_tail or 'Unknown error'}"
 
     if not proc.stdout:
@@ -2010,6 +2111,7 @@ def render_stage_3():
                     direct_url=direct_or_error,
                     start_time=start_time,
                     duration=clip_duration,
+                    source_video_url=video_url,
                 )
                 if not ok_clip or clip_buffer is None:
                     st.error(clip_error or "فشل تجهيز المقطع.")
