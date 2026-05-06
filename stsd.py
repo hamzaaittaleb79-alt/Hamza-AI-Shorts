@@ -264,7 +264,7 @@ def _parse_json3_to_segments(json3_text: str) -> List[Dict]:
 
 
 def _fetch_transcript_with_ytdlp(video_id: str) -> Optional[List[Dict]]:
-    """Scout attempt: fetch auto subtitles with yt-dlp, then parse temp subtitle files."""
+    """Fetch raw subtitles with yt-dlp while preferring original English when available."""
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     output_template = temp_path(f"{video_id}.%(ext)s")
     cmd = [
@@ -304,14 +304,20 @@ def _fetch_transcript_with_ytdlp(video_id: str) -> Optional[List[Dict]]:
     if not subtitle_files:
         return None
 
-    selected_file = None
-    for file_path in subtitle_files:
+    def subtitle_priority(file_path: Path) -> int:
         lower_name = file_path.name.lower()
-        if ".en." in lower_name or ".ar." in lower_name or ".en-" in lower_name or ".ar-" in lower_name:
-            selected_file = file_path
-            break
-    if selected_file is None:
-        selected_file = subtitle_files[0]
+        # Prefer English original tracks first, then Arabic, then others.
+        if ".en-orig." in lower_name or ".en.orig." in lower_name:
+            return 0
+        if ".en." in lower_name or ".en-" in lower_name:
+            return 1
+        if ".ar-orig." in lower_name or ".ar.orig." in lower_name:
+            return 2
+        if ".ar." in lower_name or ".ar-" in lower_name:
+            return 3
+        return 9
+
+    selected_file = sorted(subtitle_files, key=subtitle_priority)[0]
 
     try:
         content = selected_file.read_text(encoding="utf-8", errors="ignore")
@@ -357,6 +363,7 @@ def _fetch_transcript_from_proxy(video_id: str) -> Optional[List[Dict]]:
             return None
 
         chosen_caption = None
+        # Prefer original English captions, then Arabic, then fallback.
         for caption in captions:
             language_code = str(
                 caption.get("language_code")
@@ -365,9 +372,21 @@ def _fetch_transcript_from_proxy(video_id: str) -> Optional[List[Dict]]:
                 or caption.get("srclang")
                 or ""
             ).lower()
-            if language_code.startswith(("ar", "en", "fr")):
+            if language_code.startswith("en"):
                 chosen_caption = caption
                 break
+        if chosen_caption is None:
+            for caption in captions:
+                language_code = str(
+                    caption.get("language_code")
+                    or caption.get("code")
+                    or caption.get("lang")
+                    or caption.get("srclang")
+                    or ""
+                ).lower()
+                if language_code.startswith("ar"):
+                    chosen_caption = caption
+                    break
 
         if chosen_caption is None:
             chosen_caption = captions[0]
@@ -897,29 +916,27 @@ def analyze_with_ai(transcript: List[Dict], custom_keywords: Optional[List[str]]
         keyword_text = ", ".join(custom_keywords or [])
 
         system_prompt = (
-            "You are an expert short-form video editor and viral content analyst. "
-            "Analyze the ORIGINAL RAW transcript only. Do not translate transcript text, do not rewrite transcript lines, "
-            "and keep timestamps grounded in the provided transcript format [MM:SS] Text."
+            "You are an expert short-form video editor and viral moments analyst. "
+            "Always analyze the transcript in its original language. Never translate or rewrite the transcript content."
         )
         user_prompt = f"""
-Analyze this raw transcript and extract exactly {top_n} best viral moments.
+حلل النص التالي بلغته الأصلية. استخرج أفضل {top_n} لقطات مشوقة.
+أرجع النتيجة بتنسيق JSON يحتوي على Start_Time و Duration و Title.
 
-Rules:
-1) Use the original transcript text and timestamps exactly as context.
-2) Pick clips likely to perform strongly on TikTok/Reels/Shorts.
-3) Return strict JSON array only, each item with keys:
-   - title_ar (string)
-   - title_en (string)
-   - timestamp (MM:SS)
-   - start_time (number, seconds)
-   - end_time (number, seconds)
-   - viral_score (number 0-100)
-   - snippet (string, short excerpt from original transcript)
-4) If transcript language is English, provide both Arabic and English titles.
-5) If transcript language is not English, still provide both Arabic and English titles when possible.
-6) Do not return markdown, explanations, or any text outside JSON.
+Constraints:
+- Keep the transcript content as-is (raw), no translation.
+- Use timestamps grounded in the provided [MM:SS] transcript lines.
+- Return JSON array only (no markdown, no explanations).
+- If the transcript is English, make Title bilingual (Arabic | English).
+- If custom keywords exist, prioritize them: {keyword_text if keyword_text else "none"}.
 
-Custom keywords priority: {keyword_text if keyword_text else "none"}
+Expected JSON item shape:
+{{
+  "Start_Time": <number_seconds>,
+  "Duration": <number_seconds>,
+  "Title": "<string>"
+}}
+
 Detected English transcript: {"yes" if is_english else "no"}
 
 RAW TRANSCRIPT:
@@ -952,24 +969,36 @@ RAW TRANSCRIPT:
             for item in parsed[:top_n]:
                 if not isinstance(item, dict):
                     continue
-                title_ar = str(item.get("title_ar", "")).strip()
-                title_en = str(item.get("title_en", "")).strip()
-                title = f"{title_ar} | {title_en}".strip(" |")
-                timestamp = str(item.get("timestamp", "00:00")).strip()
-                start_time = float(item.get("start_time", 0.0) or 0.0)
-                end_time = float(item.get("end_time", start_time + 45.0) or (start_time + 45.0))
+                title_raw = str(
+                    item.get("Title")
+                    or item.get("title")
+                    or item.get("TITLE")
+                    or ""
+                ).strip()
+                start_time = float(
+                    item.get("Start_Time")
+                    or item.get("start_time")
+                    or item.get("start")
+                    or 0.0
+                )
+                duration = float(
+                    item.get("Duration")
+                    or item.get("duration")
+                    or 45.0
+                )
+                end_time = start_time + max(1.0, duration)
                 if end_time <= start_time:
                     end_time = start_time + 45.0
-                viral_score = float(item.get("viral_score", 50.0) or 50.0)
-                snippet = _normalize_transcript_text(str(item.get("snippet", "")))
+                mm = int(start_time) // 60
+                ss = int(start_time) % 60
+                timestamp = f"{mm:02d}:{ss:02d}"
+                snippet = ""
                 normalized.append({
-                    "title": title if title else "Viral Moment | لقطة فيروسية",
-                    "title_ar": title_ar,
-                    "title_en": title_en,
+                    "title": title_raw if title_raw else "لقطة مشوقة | Viral Moment",
                     "timestamp": timestamp,
                     "start_time": start_time,
                     "end_time": end_time,
-                    "viral_score": max(0.0, min(100.0, viral_score)),
+                    "viral_score": 90.0,
                     "snippet": snippet,
                 })
 
