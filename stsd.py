@@ -155,11 +155,19 @@ def _normalize_transcript_segments(raw_segments: List[Dict]) -> List[Dict]:
     """Normalize transcript segments into the app's expected structure."""
     normalized = []
     for index, segment in enumerate(raw_segments or []):
-        text = _normalize_transcript_text(str(segment.get("text", "")))
+        if isinstance(segment, dict):
+            text_value = segment.get("text", "")
+            start_raw = segment.get("start", index * 5.0)
+            duration_raw = segment.get("duration", 5.0)
+        else:
+            text_value = getattr(segment, "text", "")
+            start_raw = getattr(segment, "start", index * 5.0)
+            duration_raw = getattr(segment, "duration", 5.0)
+        text = _normalize_transcript_text(str(text_value))
         if not text:
             continue
-        start_value = float(segment.get("start", index * 5.0) or index * 5.0)
-        duration_value = float(segment.get("duration", 5.0) or 5.0)
+        start_value = float(start_raw or index * 5.0)
+        duration_value = float(duration_raw or 5.0)
         normalized.append({
             "text": text,
             "start": start_value,
@@ -174,6 +182,42 @@ def _normalize_transcript_text(text: str) -> str:
     cleaned_text = cleaned_text.replace("\r", " ").replace("\n", " ")
     cleaned_text = re.sub(r"\s+", " ", cleaned_text)
     return cleaned_text.strip()
+
+
+def _dedupe_repeated_words(text: str) -> str:
+    """Remove immediate repeated words like 'go go go' -> 'go'."""
+    words = (text or "").split()
+    if not words:
+        return ""
+    output_words = [words[0]]
+    for word in words[1:]:
+        if word.lower() != output_words[-1].lower():
+            output_words.append(word)
+    return " ".join(output_words)
+
+
+def _clean_transcript_for_analysis(transcript: List[Dict]) -> List[Dict]:
+    """Remove non-informative caption labels and repeated noise before AI analysis."""
+    cleaned_segments: List[Dict] = []
+    noise_pattern = re.compile(r"^\[(music|applause|laughter|noise|silence)\]$", re.IGNORECASE)
+    for seg in transcript or []:
+        raw_text = _normalize_transcript_text(str(seg.get("text", "")))
+        raw_text = re.sub(r"\[(music|applause|laughter|noise|silence)\]", " ", raw_text, flags=re.IGNORECASE)
+        raw_text = re.sub(r"\((music|applause|laughter|noise|silence)\)", " ", raw_text, flags=re.IGNORECASE)
+        raw_text = re.sub(r"\s+", " ", raw_text).strip()
+        if not raw_text or noise_pattern.match(raw_text):
+            continue
+        clean_text = _dedupe_repeated_words(raw_text)
+        if not clean_text:
+            continue
+        if cleaned_segments and cleaned_segments[-1].get("text", "").strip().lower() == clean_text.lower():
+            continue
+        cleaned_segments.append({
+            "text": clean_text,
+            "start": float(seg.get("start", 0.0) or 0.0),
+            "duration": float(seg.get("duration", 5.0) or 5.0),
+        })
+    return cleaned_segments
 
 
 def _parse_vtt_to_segments(vtt_text: str) -> List[Dict]:
@@ -466,17 +510,24 @@ def _get_transcript_smart_result(video_id: str) -> Tuple[Optional[List[Dict]], s
     Lightweight cloud-based transcript fetcher.
 
     Strict order:
-    1) yt-dlp auto subtitles
-    2) Proxy captions endpoints
-    3) Video description fallback
+    1) Manual transcripts (en/ar) via YouTubeTranscriptApi
+    2) Auto subtitles via yt-dlp (--write-auto-subs)
+    3) Proxy captions endpoints
+    4) None (description is handled outside as last resort)
     """
+    manual_or_generated = fetch_transcript(video_id, languages=["en", "ar"])
+    if manual_or_generated:
+        normalized = _clean_transcript_for_analysis(_normalize_transcript_segments(manual_or_generated))
+        if normalized:
+            return normalized, "youtube_transcript_api"
+
     ytdlp_transcript = _fetch_transcript_with_ytdlp(video_id)
     if ytdlp_transcript:
-        return ytdlp_transcript, "ytdlp_subtitles"
+        return _clean_transcript_for_analysis(ytdlp_transcript), "ytdlp_subtitles"
 
     proxy_transcript = _fetch_transcript_from_proxy(video_id)
     if proxy_transcript:
-        return proxy_transcript, "proxy_captions"
+        return _clean_transcript_for_analysis(proxy_transcript), "proxy_captions"
 
     return None, "none"
 
@@ -485,13 +536,14 @@ def get_transcript_smart(video_id: str) -> Optional[List[Dict]]:
     transcript, _source = _get_transcript_smart_result(video_id)
     if not transcript:
         return None
+    cleaned = _clean_transcript_for_analysis(transcript)
     return [
         {
             "text": _normalize_transcript_text(segment.get("text", "")),
             "start": float(segment.get("start", 0.0) or 0.0),
             "duration": float(segment.get("duration", 5.0) or 5.0),
         }
-        for segment in transcript
+        for segment in cleaned
         if _normalize_transcript_text(segment.get("text", ""))
     ]
 
@@ -896,6 +948,9 @@ def analyze_with_ai(transcript: List[Dict], custom_keywords: Optional[List[str]]
     """Primary AI analysis entry point for transcript-driven viral moment detection."""
     if not transcript:
         return []
+    transcript = _clean_transcript_for_analysis(transcript)
+    if not transcript:
+        return []
 
     def _looks_english_text(text: str) -> bool:
         letters = re.findall(r"[A-Za-z]", text or "")
@@ -930,6 +985,7 @@ Constraints:
 - Return JSON array only (no markdown, no explanations).
 - If the transcript is English, make Title bilingual (Arabic | English).
 - If custom keywords exist, prioritize them: {keyword_text if keyword_text else "none"}.
+- حتى لو كان النص غير واضح تماماً، حاول استنتاج أفضل 3 لقطات بناءً على كثافة الكلمات أو تغير المواضيع. لا تعِد نتيجة فارغة أبداً.
 
 Expected JSON item shape:
 {{
@@ -1003,7 +1059,21 @@ RAW TRANSCRIPT:
                     "snippet": snippet,
                 })
 
-            return normalized if normalized else None
+            if normalized:
+                while len(normalized) < top_n:
+                    idx = len(normalized)
+                    start_time = float(transcript[min(idx, len(transcript) - 1)].get("start", idx * 15.0))
+                    mm = int(start_time) // 60
+                    ss = int(start_time) % 60
+                    normalized.append({
+                        "title": f"لقطة مقترحة {idx + 1} | Suggested Moment {idx + 1}",
+                        "timestamp": f"{mm:02d}:{ss:02d}",
+                        "start_time": start_time,
+                        "end_time": start_time + 45.0,
+                        "viral_score": 75.0,
+                        "snippet": transcript[min(idx, len(transcript) - 1)].get("text", ""),
+                    })
+            return normalized[:top_n] if normalized else None
         except Exception:
             return None
 
@@ -1013,6 +1083,19 @@ RAW TRANSCRIPT:
 
     repunctuated_transcript = _repunctuate_transcript(transcript)
     fallback = find_viral_moments(repunctuated_transcript, custom_keywords=custom_keywords, top_n=top_n)
+    if not fallback:
+        for idx in range(min(top_n, len(transcript))):
+            start_time = float(transcript[idx].get("start", idx * 15.0))
+            mm = int(start_time) // 60
+            ss = int(start_time) % 60
+            fallback.append({
+                "title": f"لقطة مقترحة {idx + 1} | Suggested Moment {idx + 1}",
+                "timestamp": f"{mm:02d}:{ss:02d}",
+                "start_time": start_time,
+                "end_time": start_time + 45.0,
+                "viral_score": 70.0,
+                "snippet": transcript[idx].get("text", ""),
+            })
     # Keep bilingual titles in fallback path when transcript is mostly English.
     if _looks_english_text(format_transcript(transcript, show_timestamps=False)):
         for moment in fallback:
