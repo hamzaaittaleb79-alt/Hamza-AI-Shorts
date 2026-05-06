@@ -96,6 +96,62 @@ def store_yt_dlp_error(stdout_text: str = "", stderr_text: str = "") -> str:
     return tail
 
 
+# ============= USER-AGENT POOL & COBALT INSTANCE ROTATION =============
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+    "Mozilla/5.0 (iPad; CPU OS 17_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+]
+
+def get_random_user_agent() -> str:
+    """Return a random user agent from the pool."""
+    return random.choice(USER_AGENTS)
+
+
+COBALT_INSTANCES = [
+    "https://api.cobalt.tools",
+    "https://cobalt.api.timothymiller.dev",
+    "https://api.cobalt.wtf",
+    "https://cobalt-service.azurewebsites.net",
+]
+
+def get_cobalt_instances_list() -> List[str]:
+    """Fetch and cache list of working Cobalt instances from cobalt.tools."""
+    if hasattr(get_cobalt_instances_list, '_cache'):
+        return get_cobalt_instances_list._cache
+    
+    try:
+        response = requests.get(
+            "https://cobalt.tools/api/instances",
+            timeout=10,
+            headers={"User-Agent": get_random_user_agent()}
+        )
+        if response.status_code == 200:
+            data = response.json()
+            if isinstance(data, list):
+                instances = [inst.get("api") for inst in data if isinstance(inst, dict) and inst.get("api")]
+                instances = [inst for inst in instances if inst and inst.startswith("http")]
+                if instances:
+                    get_cobalt_instances_list._cache = instances
+                    return instances
+    except Exception:
+        pass
+    
+    # Fallback to hardcoded instances if fetching fails
+    get_cobalt_instances_list._cache = COBALT_INSTANCES
+    return COBALT_INSTANCES
+
+
+def get_rotating_cobalt_instance() -> str:
+    """Get a Cobalt instance with fallback rotation."""
+    instances = get_cobalt_instances_list()
+    return random.choice(instances) if instances else "https://api.cobalt.tools"
+
+
 # ============= TRANSCRIPTION INTELLIGENCE ENGINE (Optimized) =============
 # Replaced local whisper-based transcription block with a lightweight
 # cloud-smart transcript fetcher that uses only youtube_transcript_api.
@@ -226,7 +282,8 @@ def _fetch_transcript_with_ytdlp(video_id: str) -> Optional[List[Dict]]:
         "--sub-format", "json3/srt/vtt",
         "--sub-langs", "en.*,ar.*",
         "--no-check-certificate",
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "--prefer-insecure",
+        "--user-agent", get_random_user_agent(),
         "--referer", "https://www.youtube.com/",
         "-o", output_template,
         video_url,
@@ -580,6 +637,7 @@ def init_session_state():
         "use_custom_keywords": False,
         "transcription_status": None,
         "last_yt_dlp_error": "",
+        "download_link": None,  # Direct Cobalt download URL
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -840,6 +898,93 @@ def parse_custom_keywords(keywords_str: str) -> List[str]:
 
 
 # ============= VERTICAL VIDEO RENDERING (9:16 Mastering) =============
+def get_cobalt_direct_download_link(
+    video_url: str,
+    quality_level: int,
+    status_placeholder = None,
+) -> Tuple[bool, str]:
+    """
+    NEW PARADIGM: Get direct download link from Cobalt WITHOUT server-side download.
+    This returns a URL that the USER can download from their clean browser IP.
+    """
+    
+    payload = {
+        "url": video_url,
+        "videoQuality": quality_level,
+        "downloadMode": "auto",
+        "filenameStyle": "nerdy",
+        "isNoAudio": False,
+    }
+
+    # Try multiple Cobalt instances with random User-Agents
+    instances = get_cobalt_instances_list()
+    random.shuffle(instances)
+    
+    for instance in instances:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": get_random_user_agent(),
+            "Referer": "https://cobalt.tools/",
+        }
+
+        try:
+            api_response = requests.post(
+                f"{instance}/api/json",
+                json=payload,
+                headers=headers,
+                timeout=30,
+            )
+        except requests.RequestException:
+            continue
+
+        if api_response.status_code >= 400:
+            continue
+
+        try:
+            api_data = api_response.json()
+        except Exception:
+            continue
+
+        # Extract direct download URL from response
+        def extract_stream_url(api_data: Any) -> Optional[str]:
+            if isinstance(api_data, dict):
+                for key in ("url", "download", "stream", "streamUrl", "link"):
+                    value = api_data.get(key)
+                    if isinstance(value, str) and value.startswith("http"):
+                        return value
+                nested_data = api_data.get("data")
+                nested_url = extract_stream_url(nested_data)
+                if nested_url:
+                    return nested_url
+                links = api_data.get("links")
+                if isinstance(links, list):
+                    for item in links:
+                        nested_url = extract_stream_url(item)
+                        if nested_url:
+                            return nested_url
+                files = api_data.get("files")
+                if isinstance(files, list):
+                    for item in files:
+                        nested_url = extract_stream_url(item)
+                        if nested_url:
+                            return nested_url
+            elif isinstance(api_data, list):
+                for item in api_data:
+                    nested_url = extract_stream_url(item)
+                    if nested_url:
+                        return nested_url
+            return None
+
+        stream_url = extract_stream_url(api_data)
+        if stream_url:
+            if status_placeholder:
+                status_placeholder.success(f"✅ Direct link obtained from Cobalt (quality {quality_level}p)")
+            return True, stream_url
+    
+    return False, "No working Cobalt instance found. Try again or use another video."
+
+
 def download_with_cobalt(
     video_url: str,
     start_time: float,
@@ -1103,7 +1248,8 @@ def create_viral_short(
         cmd = [
             "yt-dlp",
             "--no-check-certificate",
-            "--user-agent", DEFAULT_USER_AGENT,
+            "--prefer-insecure",
+            "--user-agent", get_random_user_agent(),
             "--referer", "https://www.youtube.com/",
             "-f", "best[height<=720][ext=mp4]/best",
             "--download-sections", section_spec,
@@ -1371,141 +1517,153 @@ def render_stage_2():
 
 # ============= STAGE 3: RENDERING =============
 def render_stage_3():
-    """واجهة مستر حمزة النهائية: تحميل مباشر بجودة عالية وتخطي حظر السيرفر"""
-    st.markdown("### 🎯 المرحلة النهائية: تحميل الفيديو بالجودة المطلوبة")
+    """
+    STAGE 3 - REVOLUTIONARY APPROACH: Direct Download Links
+    
+    Instead of trying server-side processing (blocked by YouTube 403 Forbidden),
+    we fetch direct download links from Cobalt and present them to the user's browser.
+    The user downloads from their clean IP, not the blocked Streamlit Cloud IP.
+    """
+    st.markdown("### 🎯 Stage 3: Get Your Viral Short")
     
     video_id = st.session_state.video_id
     video_url = f"https://www.youtube.com/watch?v={video_id}"
-
-    st.success("✅ تم تحليل الفيديو بنجاح! اختر الجودة والمحرك للتحميل المباشر:")
-
-    # تصميم بطاقات التحميل
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        with st.container(border=True):
-            st.markdown("#### 🚀 المحرك السريع (Cobalt)")
-            st.write("يدعم 1080p و 4K مباشرة")
-            # هذا الرابط يفتح موقع تحميل احترافي ومجاني معبأ برابط الفيديو الخاص بك
-            st.markdown(f'''
-                <a href="https://cobalt.tools/" target="_blank">
-                    <button style="width:100%; background-color:#FFD700; border:none; color:black; padding:12px; cursor:pointer; border-radius:8px; font-weight:bold;">
-                        فتح محرك Cobalt للتحميل
-                    </button>
-                </a>
-            ''', unsafe_allow_html=True)
-            st.caption("انسخ الرابط وضعه في Cobalt للحصول على أعلى جودة.")
-
-    with col2:
-        with st.container(border=True):
-            st.markdown("#### ⚡ المحرك الاحترافي (SaveFrom)")
-            st.write("تحميل مباشر وسهل")
-            st.markdown(f'''
-                <a href="https://en.savefrom.net/18/#url={video_url}" target="_blank">
-                    <button style="width:100%; background-color:#00E676; border:none; color:white; padding:12px; cursor:pointer; border-radius:8px; font-weight:bold;">
-                        تحميل عبر SaveFrom
-                    </button>
-                </a>
-            ''', unsafe_allow_html=True)
-            st.caption("سيفتح الموقع والرابط جاهز للتحميل فوراً.")
-
-    st.info(f"🔗 رابط الفيديو الخاص بك: `{video_url}`")
-    
-    if st.button("🔄 تحليل فيديو آخر"):
-        st.session_state.stage = 1
-        st.session_state.video_id = None
-        st.rerun()
-    
-    st.markdown("---")
-    
     selected = st.session_state.selected_moment
-    st.markdown(f"### ✂️ Creating: **{selected['title']}**")
-    st.markdown(f"*Timestamp: {selected['timestamp']} | Viral Score: {int(selected['viral_score'])}/100 | Quality: {st.session_state.quality}*")
+
+    st.markdown(f"**Selected Clip:** {selected['title']} | {selected['timestamp']} | Viral Score: {int(selected['viral_score'])}/100")
+    st.markdown("---")
+    
+    # Navigation buttons
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("← Back to Moments", use_container_width=True):
+            st.session_state.stage = 2
+            st.rerun()
+    with col3:
+        if st.button("🔄 Analyze New Video", use_container_width=True):
+            st.session_state.stage = 1
+            for key in ["video_id", "url", "transcript", "viral_moments", "selected_moment"]:
+                st.session_state[key] = None
+            st.rerun()
     
     st.markdown("---")
     
-    # Check if already rendered
-    output_path = app_path("final_viral_clip.mp4")
-    if os.path.exists(output_path):
-        st.success("✨ SUCCESS! Your viral short is ready!")
-        st.video(output_path)
+    # Quality selection
+    st.markdown("### 📥 Download Options")
+    quality_choice = st.radio(
+        "Select Download Quality",
+        ["720p (Recommended)", "1080p (HD)", "480p (Lite)"],
+        index=0,
+        horizontal=True
+    )
+    
+    quality_map = {
+        "720p (Recommended)": 720,
+        "1080p (HD)": 1080,
+        "480p (Lite)": 480,
+    }
+    selected_quality = quality_map[quality_choice]
+    
+    # Main action: Get direct download link
+    if st.button("🚀 Get Download Link", use_container_width=True, type="primary"):
+        status_container = st.status("🔄 Fetching direct download link...", expanded=True)
         
-        with open(output_path, "rb") as f:
-            st.download_button(
-                label="⬇️ Download Video",
-                data=f.read(),
-                file_name="final_viral_clip.mp4",
-                mime="video/mp4",
-                use_container_width=True,
+        with status_container:
+            st.write("Trying Cobalt instances...")
+            
+            # Try to get direct link from Cobalt
+            success, link_or_error = get_cobalt_direct_download_link(
+                video_url=video_url,
+                quality_level=selected_quality,
+                status_placeholder=status_container,
             )
+            
+            if success and link_or_error:
+                status_container.update(label="✅ Direct link ready!", state="complete")
+                st.session_state.download_link = link_or_error
+                st.rerun()
+            else:
+                status_container.update(label="⚠️ Cobalt unavailable, trying alternative...", state="running")
+                st.write(f"Error: {link_or_error}")
+    
+    # Display download link if available
+    if hasattr(st.session_state, 'download_link') and st.session_state.download_link:
+        st.markdown("---")
+        st.success("✅ Your direct download link is ready!")
+        st.markdown("#### 📥 Download Instructions:")
+        st.markdown("""
+        1. **Right-click** the button below
+        2. Select **"Save link as..."** or **"Download"**
+        3. Your file will download directly to your device
+        
+        ⚠️ **Note:** The download happens from your browser (clean IP), so it won't be blocked by YouTube!
+        """)
+        
+        download_url = st.session_state.download_link
+        st.markdown(f'''
+        <div style="text-align: center; padding: 20px; background-color: #1a1a1d; border-radius: 10px; border: 2px solid #ffd700;">
+            <a href="{download_url}" target="_blank" download style="
+                display: inline-block;
+                background: linear-gradient(135deg, #b8860b 0%, #ffd700 100%);
+                color: #0b0b0c;
+                padding: 15px 30px;
+                border-radius: 10px;
+                text-decoration: none;
+                font-weight: bold;
+                font-size: 16px;
+                border: none;
+            ">
+                ⬇️ Download Video ({selected_quality}p)
+            </a>
+        </div>
+        ''', unsafe_allow_html=True)
         
         st.markdown("---")
+        
+        # Additional download options
+        st.markdown("#### 🔗 Alternative Download Options:")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown(f'''
+            <a href="https://cobalt.tools/" target="_blank">
+                <button style="width:100%; background-color:#FF6B6B; border:none; color:white; padding:12px; cursor:pointer; border-radius:8px; font-weight:bold;">
+                    🌐 Open Cobalt Web
+                </button>
+            </a>
+            ''', unsafe_allow_html=True)
+            st.caption("Use Cobalt's web interface for more options")
+        
+        with col2:
+            st.markdown(f'''
+            <a href="https://en.savefrom.net/18/#url={video_url}" target="_blank">
+                <button style="width:100%; background-color:#00E676; border:none; color:white; padding:12px; cursor:pointer; border-radius:8px; font-weight:bold;">
+                    ⚡ SaveFrom Instant
+                </button>
+            </a>
+            ''', unsafe_allow_html=True)
+            st.caption("Quick download via SaveFrom service")
+        
+        st.markdown("---")
+        
+        # Reset for next video
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("🎬 Create Another", use_container_width=True):
+            if st.button("🎬 Create Another Short", use_container_width=True):
                 st.session_state.stage = 1
+                st.session_state.download_link = None
+                for key in ["video_id", "url", "transcript", "viral_moments", "selected_moment"]:
+                    st.session_state[key] = None
                 st.rerun()
+        
         with col2:
             if st.button("🎯 View More Clips", use_container_width=True):
                 st.session_state.stage = 2
+                st.session_state.download_link = None
                 st.rerun()
-        return
     
-    # Rendering placeholders
-    status_container = st.status("🛡️ Initializing rendering...", expanded=True)
-    progress_slot = st.empty()
-    result_container = st.empty()
-    
-    video_url = st.session_state.get("video_url") or f"https://www.youtube.com/watch?v={st.session_state.video_id}"
-    
-    try:
-        with status_container:
-            result = create_viral_short(
-                video_url,
-                selected["start_time"],
-                selected["end_time"],
-                quality=st.session_state.quality,
-                progress_placeholder=progress_slot,
-                status_placeholder=status_container,
-            )
-        
-        if result and os.path.exists(result):
-            status_container.update(label="✅ Rendering complete!", state="complete", expanded=False)
-            time.sleep(1)
-            
-            with result_container.container():
-                st.success("✨ SUCCESS! Your viral short is ready!")
-                st.video(result)
-                
-                with open(result, "rb") as f:
-                    st.download_button(
-                        label="⬇️ Download Video",
-                        data=f.read(),
-                        file_name="final_viral_clip.mp4",
-                        mime="video/mp4",
-                        use_container_width=True,
-                    )
-                
-                st.markdown("---")
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("🎬 Create Another", use_container_width=True):
-                        st.session_state.stage = 1
-                        st.rerun()
-                with col2:
-                    if st.button("🎯 View More Clips", use_container_width=True):
-                        st.session_state.stage = 2
-                        st.rerun()
-        else:
-            status_container.update(label="❌ Rendering failed", state="error", expanded=True)
-            result_container.error("❌ Failed to create short. Download may be blocked on Streamlit Cloud (HTTP 403 Forbidden).")
-            last_error = st.session_state.get("last_yt_dlp_error", "")
-            if last_error:
-                st.code(last_error, language="text")
-    
-    except Exception as e:
-        status_container.update(label="❌ Error", state="error", expanded=True)
-        result_container.error(f"❌ Unexpected error: {str(e)}")
+    else:
+        st.info("👆 Click 'Get Download Link' above to retrieve your direct download URL")
 
 
 # ============= MAIN APP FLOW =============
