@@ -638,6 +638,8 @@ def init_session_state():
         "transcription_status": None,
         "last_yt_dlp_error": "",
         "download_link": None,  # Direct Cobalt download URL
+        "download_triggered": False,  # Auto-download trigger flag
+        "fast_mode_enabled": False,  # Fast Engine mode flag
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -890,22 +892,144 @@ def format_hhmmss(seconds_value: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def parse_custom_keywords(keywords_str: str) -> List[str]:
-    """Parse comma-separated keywords into a list."""
-    if not keywords_str or not keywords_str.strip():
-        return []
-    return [kw.strip().lower() for kw in keywords_str.split(",") if kw.strip()]
+def get_fast_engine_metadata(video_id: str) -> Optional[Dict]:
+    """
+    FAST ENGINE: Quick metadata fetch when transcript is slow.
+    Returns video info and quick viral analysis without full transcripts.
+    Timeout: 10 seconds max.
+    """
+    try:
+        # Try to get video info quickly
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'socket_timeout': 10,
+            'default_search': 'auto',
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            if info:
+                return {
+                    "title": info.get("title", ""),
+                    "duration": info.get("duration", 0),
+                    "uploader": info.get("uploader", ""),
+                    "description": info.get("description", "")[:500],  # First 500 chars
+                }
+    except Exception:
+        pass
+    return None
+
+
+def generate_viral_moments_from_description(description: str, title: str) -> List[Dict]:
+    """
+    FAST ENGINE: Generate quick viral moments from video metadata when transcripts fail.
+    Analyzes title and description to create 3 default moments.
+    """
+    moments = []
+    
+    # Check for viral keywords in title/description
+    text = f"{title} {description}".lower()
+    keywords_found = []
+    
+    viral_keywords = {
+        "shocking": 95,
+        "incredible": 85,
+        "amazing": 80,
+        "secret": 75,
+        "hack": 70,
+        "money": 65,
+        "trending": 90,
+        "viral": 100,
+        "exclusive": 75,
+    }
+    
+    for keyword, score in viral_keywords.items():
+        if keyword in text:
+            keywords_found.append((keyword, score))
+    
+    if keywords_found:
+        keywords_found.sort(key=lambda x: x[1], reverse=True)
+        
+        # Create 3 moments based on found keywords
+        for idx, (keyword, score) in enumerate(keywords_found[:3]):
+            start_time = idx * 45  # Stagger moments
+            mm = start_time // 60
+            ss = start_time % 60
+            
+            moments.append({
+                "title": keyword.capitalize(),
+                "timestamp": f"{mm:02d}:{ss:02d}",
+                "start_time": float(start_time),
+                "end_time": float(start_time + 45),
+                "viral_score": min(100, score),
+                "snippet": description[:80] + "..." if description else "Fast Engine moment",
+            })
+    else:
+        # Default moments if no keywords found
+        for i in range(3):
+            moments.append({
+                "title": f"Moment {i+1}",
+                "timestamp": f"00:{i*15:02d}",
+                "start_time": float(i * 15),
+                "end_time": float(i * 15 + 45),
+                "viral_score": 50,
+                "snippet": "استخدام المحرك السريع",
+            })
+    
+    return moments
 
 
 # ============= VERTICAL VIDEO RENDERING (9:16 Mastering) =============
+def create_html_download_trigger(download_url: str, filename: str = "video.mp4") -> str:
+    """
+    Create an HTML/JavaScript snippet that auto-triggers browser download.
+    This opens the download dialog immediately without page redirect.
+    """
+    # Escape URL for JavaScript
+    safe_url = download_url.replace('"', '\\"').replace("'", "\\'")
+    
+    html_code = f"""
+    <script>
+    (function() {{
+        // Create invisible link element
+        const link = document.createElement('a');
+        link.href = "{safe_url}";
+        link.download = "{filename}";
+        link.style.display = 'none';
+        
+        // Append to DOM and trigger click
+        document.body.appendChild(link);
+        link.click();
+        
+        // Clean up
+        document.body.removeChild(link);
+        
+        // Show status
+        console.log('Download triggered for: {filename}');
+    }})();
+    </script>
+    
+    <div style="text-align: center; padding: 20px; background: #0b0b0c; border-radius: 10px; border: 2px solid #ffd700;">
+        <p style="color: #ffd700; font-weight: bold; font-size: 16px;">
+            ⬇️ التحميل جاري من جهازك الآن...
+        </p>
+        <p style="color: #c7b89a; font-size: 14px;">
+            إذا لم يبدأ التحميل، اضغط <a href="{safe_url}" download="{filename}" style="color: #ffd700; text-decoration: underline;">هنا</a>
+        </p>
+    </div>
+    """
+    return html_code
+
+
 def get_cobalt_direct_download_link(
     video_url: str,
     quality_level: int,
     status_placeholder = None,
 ) -> Tuple[bool, str]:
     """
-    NEW PARADIGM: Get direct download link from Cobalt WITHOUT server-side download.
-    This returns a URL that the USER can download from their clean browser IP.
+    ULTRA-FAST PARADIGM: Get direct download link from Cobalt instantly.
+    No server processing, no waiting. Just get URL and return.
     """
     
     payload = {
@@ -933,7 +1057,7 @@ def get_cobalt_direct_download_link(
                 f"{instance}/api/json",
                 json=payload,
                 headers=headers,
-                timeout=30,
+                timeout=20,  # Reduced timeout for speed
             )
         except requests.RequestException:
             continue
@@ -978,11 +1102,9 @@ def get_cobalt_direct_download_link(
 
         stream_url = extract_stream_url(api_data)
         if stream_url:
-            if status_placeholder:
-                status_placeholder.success(f"✅ Direct link obtained from Cobalt (quality {quality_level}p)")
             return True, stream_url
     
-    return False, "No working Cobalt instance found. Try again or use another video."
+    return False, "لم نتمكن من الاتصال بـ Cobalt. حاول مرة أخرى."
 
 
 def download_with_cobalt(
@@ -1420,28 +1542,70 @@ def render_stage_1():
                     
                     try:
                         with status_placeholder:
-                            # Step 1: Strict transcript pipeline (yt-dlp -> proxy -> description)
-                            st.write("جاري التحليل عبر المحرك البديل...")
-                            transcript, transcript_source = _get_transcript_smart_result(video_id)
-
-                            if not transcript or len(transcript) == 0:
-                                status_placeholder.update(label="⚠️ No transcript available", state="error")
-                                st.warning("Try another video")
-                            else:
-                                st.write(f"✅ Successfully fetched {len(transcript)} transcript segments!")
+                            # Try fast transcript fetch with 10-second timeout
+                            import threading
+                            transcript = [None]
+                            transcript_source = ["none"]
+                            
+                            def fetch_transcript_thread():
+                                try:
+                                    t, s = _get_transcript_smart_result(video_id)
+                                    transcript[0] = t
+                                    transcript_source[0] = s
+                                except Exception:
+                                    transcript[0] = None
+                                    transcript_source[0] = "none"
+                            
+                            thread = threading.Thread(target=fetch_transcript_thread, daemon=True)
+                            thread.start()
+                            thread.join(timeout=10)  # 10-second timeout
+                            
+                            # Check if transcript was fetched
+                            if transcript[0]:
+                                st.write(f"✅ Successfully fetched {len(transcript[0])} transcript segments!")
                                 st.session_state.video_id = video_id
                                 st.session_state.video_url = video_url
-                                st.session_state.transcript = transcript
-                                st.session_state.transcript_source = transcript_source
-                                st.session_state.transcript_text = format_transcript(transcript, show_timestamps=True)
+                                st.session_state.transcript = transcript[0]
+                                st.session_state.transcript_source = transcript_source[0]
+                                st.session_state.transcript_text = format_transcript(transcript[0], show_timestamps=True)
                                 st.session_state.viral_moments = analyze_with_ai(
-                                    transcript,
+                                    transcript[0],
                                     custom_keywords=parse_custom_keywords(st.session_state.custom_keywords) if st.session_state.use_custom_keywords else None,
                                     top_n=3,
                                 )
+                                st.session_state.fast_mode_enabled = False
                                 status_placeholder.update(label="✅ Transcript loaded!", state="complete")
-                                st.session_state.stage = 2
-                                st.rerun()
+                            else:
+                                # FAST ENGINE MODE: Use metadata instead of transcript
+                                st.write("⏳ YouTube is slow... switching to Fast Engine!")
+                                status_placeholder.update(label="🚀 Using Fast Engine Mode", state="running")
+                                
+                                metadata = get_fast_engine_metadata(video_id)
+                                if metadata:
+                                    st.write(f"📹 Video: {metadata['title']}")
+                                    st.write(f"⏱️ Duration: {metadata['duration']//60} minutes")
+                                    
+                                    # Generate quick viral moments from description
+                                    quick_moments = generate_viral_moments_from_description(
+                                        metadata["description"],
+                                        metadata["title"]
+                                    )
+                                    
+                                    st.session_state.video_id = video_id
+                                    st.session_state.video_url = video_url
+                                    st.session_state.transcript = None  # No full transcript in fast mode
+                                    st.session_state.transcript_text = f"**المحرك السريع (Fast Engine)**\n\n{metadata['title']}\n\n{metadata['description']}"
+                                    st.session_state.viral_moments = quick_moments
+                                    st.session_state.fast_mode_enabled = True
+                                    st.write("✅ Ready to download!")
+                                    status_placeholder.update(label="✅ Fast Engine ready!", state="complete")
+                                else:
+                                    status_placeholder.update(label="⚠️ No transcript available", state="error")
+                                    st.warning("Try another video")
+                                    return
+                            
+                            st.session_state.stage = 2
+                            st.rerun()
                     except Exception as e:
                         status_placeholder.update(label="❌ Error", state="error")
                         st.error(f"❌ Unexpected error: {str(e)}")
@@ -1452,6 +1616,10 @@ def render_stage_1():
 def render_stage_2():
     """STAGE 2: Two-column layout with transcript and viral moments."""
     st.markdown('<div class="stage-badge">🤖 STAGE 2: SELECTION & PREVIEW</div>', unsafe_allow_html=True)
+    
+    # Show Fast Mode indicator if enabled
+    if st.session_state.fast_mode_enabled:
+        st.info("⚡ **Fast Engine Mode** - جاري استخدام المحرك السريع للتحليل السريع")
     
     # Navigation
     col_nav1, col_nav2 = st.columns([1, 10])
@@ -1484,12 +1652,15 @@ def render_stage_2():
         
         if not st.session_state.viral_moments:
             with st.spinner("🔍 Scanning for viral moments..."):
-                custom_kw = parse_custom_keywords(st.session_state.custom_keywords) if st.session_state.use_custom_keywords else None
-                st.session_state.viral_moments = analyze_with_ai(
-                    st.session_state.transcript,
-                    custom_keywords=custom_kw,
-                    top_n=3
-                )
+                if st.session_state.transcript:
+                    custom_kw = parse_custom_keywords(st.session_state.custom_keywords) if st.session_state.use_custom_keywords else None
+                    st.session_state.viral_moments = analyze_with_ai(
+                        st.session_state.transcript,
+                        custom_keywords=custom_kw,
+                        top_n=3
+                    )
+                else:
+                    st.session_state.viral_moments = []
         
         if not st.session_state.viral_moments:
             st.info("💡 No viral moments detected. Try another video!")
@@ -1512,19 +1683,20 @@ def render_stage_2():
                     ):
                         st.session_state.selected_moment = moment
                         st.session_state.stage = 3
+                        st.session_state.download_triggered = False
                         st.rerun()
 
 
 # ============= STAGE 3: DIRECT DOWNLOAD LINKS =============
 def render_stage_3():
     """
-    STAGE 3 - DIRECT HYPERLINK MODEL: Get URL and open immediately
+    STAGE 3 - ROCKET FAST MODEL: HTML/JS Auto-Download Triggers
     
-    Revolutionary approach: No server-side rendering or waiting.
-    Simply fetch the direct tunnel link from Cobalt and present it as a clickable button.
-    User downloads from their clean IP instantly.
+    Ultra-fast approach: Fetch URL from Cobalt, immediately trigger browser download.
+    No server processing, no waiting, no temporary files.
+    User's browser handles everything with clean IP.
     """
-    st.markdown("### 🎯 المرحلة النهائية: تحميل الفيديو مباشرة")
+    st.markdown("### 🚀 المرحلة النهائية: تحميل فوري")
     
     video_id = st.session_state.video_id
     video_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -1568,71 +1740,57 @@ def render_stage_3():
     if not hasattr(st.session_state, 'download_link') or not st.session_state.download_link:
         st.session_state.download_link = None
     
-    # Main action: Fetch and display direct link
-    col_fetch, col_space = st.columns([2, 3])
-    with col_fetch:
-        if st.button("🚀 احصل على رابط التحميل المباشر", use_container_width=True, type="primary"):
-            progress_bar = st.progress(0, text="🔄 جاري الاتصال بـ Cobalt...")
-            
-            try:
-                progress_bar.progress(33, text="⏳ محاولة تحميل الرابط...")
-                
-                # Fetch direct link from Cobalt (no rendering, just get the URL)
-                success, link_or_error = get_cobalt_direct_download_link(
-                    video_url=video_url,
-                    quality_level=selected_quality,
-                    status_placeholder=None,
-                )
-                
-                if success and link_or_error:
-                    progress_bar.progress(100, text="✅ تم الحصول على الرابط!")
-                    st.session_state.download_link = link_or_error
-                    time.sleep(0.5)
-                    st.rerun()
-                else:
-                    progress_bar.empty()
-                    st.error(f"❌ فشل الاتصال: {link_or_error}")
-                    st.session_state.download_link = None
-            except Exception as e:
-                progress_bar.empty()
-                st.error(f"❌ خطأ: {str(e)}")
-                st.session_state.download_link = None
+    # MAIN ACTION: Rocket button - instant download trigger
+    st.markdown("### 🚀 اضغط الزر للتحميل الفوري:")
     
-    # Display direct download button if link is available
-    if st.session_state.download_link:
-        st.markdown("---")
-        
-        # Success message in Arabic
-        st.success("✅ لقد نجحنا! اضغط للتحميل المباشر من جهازك 📥")
-        
-        st.markdown("### الرابط المباشر للتحميل:")
-        
-        # Direct hyperlink button (opens in new tab immediately)
-        download_url = st.session_state.download_link
-        col1, col2, col3 = st.columns([1, 2, 1])
-        
-        with col2:
-            st.link_button(
-                f"⬇️ ابدأ التحميل ({selected_quality}p)",
-                url=download_url,
-                use_container_width=True,
-                help="اضغط لفتح رابط التحميل المباشر"
+    if st.button("🚀 ابدأ التحميل الآن!", use_container_width=True, type="primary", key="rocket_download"):
+        # Spinner while fetching
+        with st.spinner("⏳ جاري الاتصال بالخادم السريع..."):
+            success, link_or_error = get_cobalt_direct_download_link(
+                video_url=video_url,
+                quality_level=selected_quality,
+                status_placeholder=None,
             )
         
-        # Display raw URL for copy-paste
-        st.markdown("#### 🔗 الرابط الخام (للنسخ):")
-        st.code(download_url, language="text")
+        if success and link_or_error:
+            # Store link and rerun to trigger HTML component
+            st.session_state.download_link = link_or_error
+            st.session_state.download_triggered = True
+            st.rerun()
+        else:
+            st.error(f"❌ فشل الاتصال: {link_or_error}")
+            st.session_state.download_link = None
+    
+    # AUTO-DOWNLOAD TRIGGER: If link is available, trigger download immediately
+    if st.session_state.download_link and st.session_state.get("download_triggered", False):
+        st.markdown("---")
+        st.success("✅ لقد نجحنا! التحميل يبدأ الآن من جهازك 📥")
+        
+        # Generate filename
+        video_id_short = st.session_state.video_id[:8]
+        timestamp = selected['timestamp'].replace(':', '-')
+        filename = f"viral_short_{video_id_short}_{timestamp}_{selected_quality}p.mp4"
+        
+        # Trigger auto-download using HTML/JS
+        html_trigger = create_html_download_trigger(
+            download_url=st.session_state.download_link,
+            filename=filename
+        )
+        st.components.v1.html(html_trigger, height=120)
         
         st.markdown("---")
         
-        # Instructions
-        st.markdown("""
-        #### 📋 التعليمات:
-        - اضغط الزر أعلاه لفتح رابط التحميل المباشر
-        - سيتم فتح الرابط في نافذة جديدة من متصفحك
-        - يمكنك نسخ الرابط الخام والتحميل من أي جهاز
+        # Display raw link for manual download
+        st.markdown("#### 🔗 رابط يدوي (إذا لم يبدأ التحميل):")
+        st.code(st.session_state.download_link, language="text")
         
-        ⚠️ **ملاحظة مهمة:** التحميل يتم من جهازك (IP نظيف)، وليس من السيرفر (الذي محظور)!
+        st.markdown("#### 📋 ماذا يحدث الآن:")
+        st.markdown("""
+        1. ✅ تم جلب الرابط من خادم Cobalt السريع
+        2. 📥 التحميل يبدأ الآن من متصفحك (IP نظيف)
+        3. ⏱️ لا توقف، لا انتظار - سرعة الإنترنت لديك فقط
+        
+        **السر:** التحميل يتم من جهازك، وليس من الخادم المحظور! 🎉
         """)
         
         st.markdown("---")
@@ -1643,28 +1801,29 @@ def render_stage_3():
         
         with col1:
             st.link_button(
-                "🌐 موقع Cobalt الرسمي",
+                "🌐 Cobalt الرسمي",
                 url="https://cobalt.tools/",
                 use_container_width=True,
-                help="لخيارات تحميل أكثر"
+                help="خيارات تحميل متقدمة"
             )
         
         with col2:
             st.link_button(
-                "⚡ SaveFrom سريع",
+                "⚡ SaveFrom",
                 url=f"https://en.savefrom.net/18/#url={video_url}",
                 use_container_width=True,
-                help="خدمة تحميل سريعة"
+                help="خدمة بديلة"
             )
         
         st.markdown("---")
         
-        # Navigation for next action
+        # Next actions
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🎬 فيديو قصير جديد", use_container_width=True):
                 st.session_state.stage = 1
                 st.session_state.download_link = None
+                st.session_state.download_triggered = False
                 for key in ["video_id", "url", "transcript", "viral_moments", "selected_moment"]:
                     st.session_state[key] = None
                 st.rerun()
@@ -1673,10 +1832,12 @@ def render_stage_3():
             if st.button("🎯 لقطات أخرى من نفس الفيديو", use_container_width=True):
                 st.session_state.stage = 2
                 st.session_state.download_link = None
+                st.session_state.download_triggered = False
                 st.rerun()
     
     else:
-        st.info("👆 اضغط الزر أعلاه لتحميل الفيديو مباشرة من جهازك")
+        if not st.session_state.get("download_triggered", False):
+            st.info("👆 اضغط الزر أعلاه للحصول على رابط التحميل الفوري")
 
 
 # ============= MAIN APP FLOW =============
