@@ -1515,141 +1515,154 @@ def render_stage_2():
                         st.rerun()
 
 
-# ============= STAGE 3: RENDERING =============
+# ============= STAGE 3: DIRECT DOWNLOAD LINKS =============
 def render_stage_3():
     """
-    STAGE 3 - REVOLUTIONARY APPROACH: Direct Download Links
+    STAGE 3 - DIRECT HYPERLINK MODEL: Get URL and open immediately
     
-    Instead of trying server-side processing (blocked by YouTube 403 Forbidden),
-    we fetch direct download links from Cobalt and present them to the user's browser.
-    The user downloads from their clean IP, not the blocked Streamlit Cloud IP.
+    Revolutionary approach: No server-side rendering or waiting.
+    Simply fetch the direct tunnel link from Cobalt and present it as a clickable button.
+    User downloads from their clean IP instantly.
     """
-    st.markdown("### 🎯 Stage 3: Get Your Viral Short")
+    st.markdown("### 🎯 المرحلة النهائية: تحميل الفيديو مباشرة")
     
     video_id = st.session_state.video_id
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     selected = st.session_state.selected_moment
 
-    st.markdown(f"**Selected Clip:** {selected['title']} | {selected['timestamp']} | Viral Score: {int(selected['viral_score'])}/100")
+    st.markdown(f"**اللقطة المختارة:** {selected['title']} | {selected['timestamp']} | درجة الفيروسية: {int(selected['viral_score'])}/100")
     st.markdown("---")
     
     # Navigation buttons
     col1, col2, col3 = st.columns(3)
     with col1:
-        if st.button("← Back to Moments", use_container_width=True):
+        if st.button("← العودة للقائمة", use_container_width=True):
             st.session_state.stage = 2
             st.rerun()
     with col3:
-        if st.button("🔄 Analyze New Video", use_container_width=True):
+        if st.button("🔄 فيديو جديد", use_container_width=True):
             st.session_state.stage = 1
-            for key in ["video_id", "url", "transcript", "viral_moments", "selected_moment"]:
+            for key in ["video_id", "url", "transcript", "viral_moments", "selected_moment", "download_link"]:
                 st.session_state[key] = None
             st.rerun()
     
     st.markdown("---")
     
     # Quality selection
-    st.markdown("### 📥 Download Options")
+    st.markdown("### 📥 اختر جودة التحميل")
     quality_choice = st.radio(
-        "Select Download Quality",
-        ["720p (Recommended)", "1080p (HD)", "480p (Lite)"],
+        "اختر جودة الفيديو",
+        ["720p (موصى به)", "1080p (HD)", "480p (سريع)"],
         index=0,
         horizontal=True
     )
     
     quality_map = {
-        "720p (Recommended)": 720,
+        "720p (موصى به)": 720,
         "1080p (HD)": 1080,
-        "480p (Lite)": 480,
+        "480p (سريع)": 480,
     }
     selected_quality = quality_map[quality_choice]
     
-    # Main action: Get direct download link
-    if st.button("🚀 Get Download Link", use_container_width=True, type="primary"):
-        status_container = st.status("🔄 Fetching direct download link...", expanded=True)
-        
-        with status_container:
-            st.write("Trying Cobalt instances...")
-            
-            # Try to get direct link from Cobalt
-            success, link_or_error = get_cobalt_direct_download_link(
-                video_url=video_url,
-                quality_level=selected_quality,
-                status_placeholder=status_container,
-            )
-            
-            if success and link_or_error:
-                status_container.update(label="✅ Direct link ready!", state="complete")
-                st.session_state.download_link = link_or_error
-                st.rerun()
-            else:
-                status_container.update(label="⚠️ Cobalt unavailable, trying alternative...", state="running")
-                st.write(f"Error: {link_or_error}")
+    # Initialize download link placeholder
+    if not hasattr(st.session_state, 'download_link') or not st.session_state.download_link:
+        st.session_state.download_link = None
     
-    # Display download link if available
-    if hasattr(st.session_state, 'download_link') and st.session_state.download_link:
+    # Main action: Fetch and display direct link
+    col_fetch, col_space = st.columns([2, 3])
+    with col_fetch:
+        if st.button("🚀 احصل على رابط التحميل المباشر", use_container_width=True, type="primary"):
+            progress_bar = st.progress(0, text="🔄 جاري الاتصال بـ Cobalt...")
+            
+            try:
+                progress_bar.progress(33, text="⏳ محاولة تحميل الرابط...")
+                
+                # Fetch direct link from Cobalt (no rendering, just get the URL)
+                success, link_or_error = get_cobalt_direct_download_link(
+                    video_url=video_url,
+                    quality_level=selected_quality,
+                    status_placeholder=None,
+                )
+                
+                if success and link_or_error:
+                    progress_bar.progress(100, text="✅ تم الحصول على الرابط!")
+                    st.session_state.download_link = link_or_error
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    progress_bar.empty()
+                    st.error(f"❌ فشل الاتصال: {link_or_error}")
+                    st.session_state.download_link = None
+            except Exception as e:
+                progress_bar.empty()
+                st.error(f"❌ خطأ: {str(e)}")
+                st.session_state.download_link = None
+    
+    # Display direct download button if link is available
+    if st.session_state.download_link:
         st.markdown("---")
-        st.success("✅ Your direct download link is ready!")
-        st.markdown("#### 📥 Download Instructions:")
-        st.markdown("""
-        1. **Right-click** the button below
-        2. Select **"Save link as..."** or **"Download"**
-        3. Your file will download directly to your device
         
-        ⚠️ **Note:** The download happens from your browser (clean IP), so it won't be blocked by YouTube!
-        """)
+        # Success message in Arabic
+        st.success("✅ لقد نجحنا! اضغط للتحميل المباشر من جهازك 📥")
         
+        st.markdown("### الرابط المباشر للتحميل:")
+        
+        # Direct hyperlink button (opens in new tab immediately)
         download_url = st.session_state.download_link
-        st.markdown(f'''
-        <div style="text-align: center; padding: 20px; background-color: #1a1a1d; border-radius: 10px; border: 2px solid #ffd700;">
-            <a href="{download_url}" target="_blank" download style="
-                display: inline-block;
-                background: linear-gradient(135deg, #b8860b 0%, #ffd700 100%);
-                color: #0b0b0c;
-                padding: 15px 30px;
-                border-radius: 10px;
-                text-decoration: none;
-                font-weight: bold;
-                font-size: 16px;
-                border: none;
-            ">
-                ⬇️ Download Video ({selected_quality}p)
-            </a>
-        </div>
-        ''', unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        # Additional download options
-        st.markdown("#### 🔗 Alternative Download Options:")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown(f'''
-            <a href="https://cobalt.tools/" target="_blank">
-                <button style="width:100%; background-color:#FF6B6B; border:none; color:white; padding:12px; cursor:pointer; border-radius:8px; font-weight:bold;">
-                    🌐 Open Cobalt Web
-                </button>
-            </a>
-            ''', unsafe_allow_html=True)
-            st.caption("Use Cobalt's web interface for more options")
+        col1, col2, col3 = st.columns([1, 2, 1])
         
         with col2:
-            st.markdown(f'''
-            <a href="https://en.savefrom.net/18/#url={video_url}" target="_blank">
-                <button style="width:100%; background-color:#00E676; border:none; color:white; padding:12px; cursor:pointer; border-radius:8px; font-weight:bold;">
-                    ⚡ SaveFrom Instant
-                </button>
-            </a>
-            ''', unsafe_allow_html=True)
-            st.caption("Quick download via SaveFrom service")
+            st.link_button(
+                f"⬇️ ابدأ التحميل ({selected_quality}p)",
+                url=download_url,
+                use_container_width=True,
+                help="اضغط لفتح رابط التحميل المباشر"
+            )
+        
+        # Display raw URL for copy-paste
+        st.markdown("#### 🔗 الرابط الخام (للنسخ):")
+        st.code(download_url, language="text")
         
         st.markdown("---")
         
-        # Reset for next video
+        # Instructions
+        st.markdown("""
+        #### 📋 التعليمات:
+        - اضغط الزر أعلاه لفتح رابط التحميل المباشر
+        - سيتم فتح الرابط في نافذة جديدة من متصفحك
+        - يمكنك نسخ الرابط الخام والتحميل من أي جهاز
+        
+        ⚠️ **ملاحظة مهمة:** التحميل يتم من جهازك (IP نظيف)، وليس من السيرفر (الذي محظور)!
+        """)
+        
+        st.markdown("---")
+        
+        # Alternative options
+        st.markdown("#### 🔗 خيارات بديلة:")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.link_button(
+                "🌐 موقع Cobalt الرسمي",
+                url="https://cobalt.tools/",
+                use_container_width=True,
+                help="لخيارات تحميل أكثر"
+            )
+        
+        with col2:
+            st.link_button(
+                "⚡ SaveFrom سريع",
+                url=f"https://en.savefrom.net/18/#url={video_url}",
+                use_container_width=True,
+                help="خدمة تحميل سريعة"
+            )
+        
+        st.markdown("---")
+        
+        # Navigation for next action
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("🎬 Create Another Short", use_container_width=True):
+            if st.button("🎬 فيديو قصير جديد", use_container_width=True):
                 st.session_state.stage = 1
                 st.session_state.download_link = None
                 for key in ["video_id", "url", "transcript", "viral_moments", "selected_moment"]:
@@ -1657,13 +1670,13 @@ def render_stage_3():
                 st.rerun()
         
         with col2:
-            if st.button("🎯 View More Clips", use_container_width=True):
+            if st.button("🎯 لقطات أخرى من نفس الفيديو", use_container_width=True):
                 st.session_state.stage = 2
                 st.session_state.download_link = None
                 st.rerun()
     
     else:
-        st.info("👆 Click 'Get Download Link' above to retrieve your direct download URL")
+        st.info("👆 اضغط الزر أعلاه لتحميل الفيديو مباشرة من جهازك")
 
 
 # ============= MAIN APP FLOW =============
