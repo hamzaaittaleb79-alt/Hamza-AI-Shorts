@@ -840,6 +840,112 @@ def parse_custom_keywords(keywords_str: str) -> List[str]:
 
 
 # ============= VERTICAL VIDEO RENDERING (9:16 Mastering) =============
+def download_with_cobalt(
+    video_url: str,
+    start_time: float,
+    end_time: float,
+    temp_clip_path: str,
+    quality_level: int,
+    status_placeholder = None,
+) -> Tuple[bool, str]:
+    """Download a clipped segment through the current Cobalt API."""
+    if os.path.exists(temp_clip_path):
+        try:
+            os.remove(temp_clip_path)
+        except Exception:
+            pass
+
+    payload = {
+        "url": video_url,
+        "videoQuality": quality_level,
+        "downloadMode": "auto",
+        "filenameStyle": "nerdy",
+        "isNoAudio": False,
+        "sectionStart": round(max(0.0, float(start_time)), 3),
+        "sectionEnd": round(max(0.0, float(end_time)), 3),
+    }
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
+
+    if status_placeholder:
+        status_placeholder.info(f"🛡️ Downloading clipped segment via Cobalt (quality {quality_level})...")
+
+    try:
+        api_response = requests.post(
+            "https://api.cobalt.tools/api/json",
+            json=payload,
+            headers=headers,
+            timeout=45,
+        )
+    except requests.RequestException as e:
+        return False, f"Cobalt API request failed: {e}"
+
+    if api_response.status_code >= 400:
+        return False, f"Cobalt API HTTP {api_response.status_code}: {tail_text(api_response.text)}"
+
+    try:
+        api_data = api_response.json()
+    except Exception as e:
+        return False, f"Invalid JSON from Cobalt API: {e}"
+
+    def extract_stream_url(api_data: Any) -> Optional[str]:
+        if isinstance(api_data, dict):
+            for key in ("url", "download", "stream", "streamUrl"):
+                value = api_data.get(key)
+                if isinstance(value, str) and value.startswith("http"):
+                    return value
+
+            nested_data = api_data.get("data")
+            nested_url = extract_stream_url(nested_data)
+            if nested_url:
+                return nested_url
+
+            links = api_data.get("links")
+            if isinstance(links, list):
+                for item in links:
+                    nested_url = extract_stream_url(item)
+                    if nested_url:
+                        return nested_url
+
+            files = api_data.get("files")
+            if isinstance(files, list):
+                for item in files:
+                    nested_url = extract_stream_url(item)
+                    if nested_url:
+                        return nested_url
+        elif isinstance(api_data, list):
+            for item in api_data:
+                nested_url = extract_stream_url(item)
+                if nested_url:
+                    return nested_url
+        return None
+
+    stream_url = extract_stream_url(api_data)
+    if not stream_url:
+        return False, f"Cobalt API did not return a stream URL: {tail_text(json.dumps(api_data, ensure_ascii=False), max_lines=5)}"
+
+    try:
+        with requests.get(stream_url, stream=True, timeout=120) as download_response:
+            download_response.raise_for_status()
+            with open(temp_clip_path, "wb") as out_file:
+                for chunk in download_response.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        out_file.write(chunk)
+    except requests.RequestException as e:
+        return False, f"Failed to download stream from Cobalt URL: {e}"
+    except Exception as e:
+        return False, f"Failed saving clipped video: {e}"
+
+    if os.path.exists(temp_clip_path) and os.path.getsize(temp_clip_path) > 100000:
+        return True, ""
+
+    return False, "Cobalt finished but produced an empty/too-small clip."
+
+
 def render_short_clip_ffmpeg(
     input_file: str,
     start_time: float,
@@ -953,16 +1059,15 @@ def create_viral_short(
 ) -> Optional[str]:
     """
     Production-grade short creation pipeline.
-    
+
     Flow:
     1. Request clipped segment from Cobalt API (cloud-safe)
-    2. Fallback to lower quality if API blocks/fails
+    2. Fallback to yt-dlp through a lightweight proxy if Cobalt fails
     3. Return final output path ready for upload
     """
     output_file = app_path("final_viral_clip.mp4")
     temp_clip_path = temp_path("temp_clip.mp4")
-    
-    # Validate timestamps
+
     start_seconds = max(0.0, float(start_time))
     duration = max(0.0, float(end_time) - float(start_time))
     if duration <= 0:
@@ -970,111 +1075,94 @@ def create_viral_short(
             status_placeholder.error("❌ Invalid duration")
         return None
 
-    def extract_stream_url(api_data: Any) -> Optional[str]:
-        """Extract a direct stream/download URL from variable Cobalt API responses."""
-        if isinstance(api_data, dict):
-            for key in ("url", "download", "stream", "streamUrl"):
-                value = api_data.get(key)
-                if isinstance(value, str) and value.startswith("http"):
-                    return value
+    video_id = extract_video_id(video_url) or "video"
+    start_stamp = format_hhmmss(start_seconds)
+    end_stamp = format_hhmmss(start_seconds + duration)
+    section_spec = f"*{start_stamp}-{end_stamp}"
 
-            nested_data = api_data.get("data")
-            nested_url = extract_stream_url(nested_data)
-            if nested_url:
-                return nested_url
-
-            links = api_data.get("links")
-            if isinstance(links, list):
-                for item in links:
-                    nested_url = extract_stream_url(item)
-                    if nested_url:
-                        return nested_url
-
-            files = api_data.get("files")
-            if isinstance(files, list):
-                for item in files:
-                    nested_url = extract_stream_url(item)
-                    if nested_url:
-                        return nested_url
-        elif isinstance(api_data, list):
-            for item in api_data:
-                nested_url = extract_stream_url(item)
-                if nested_url:
-                    return nested_url
-
-        return None
-
-    def run_cobalt_download_attempt(quality_level: int, attempt_label: str) -> Tuple[bool, str]:
-        """Request clipped segment from Cobalt API and save it to temp_clip.mp4."""
-        if os.path.exists(temp_clip_path):
+    def cleanup_temp_files(prefix: str) -> None:
+        for file_path in TEMP_DIR.glob(f"{prefix}*"):
             try:
-                os.remove(temp_clip_path)
+                file_path.unlink(missing_ok=True)
             except Exception:
                 pass
 
+    def run_ytdlp_proxy_fallback() -> Tuple[bool, str]:
+        """Download the clipped segment via yt-dlp through a simple Invidious proxy source."""
+        cleanup_temp_files(f"yt_fallback_{video_id}")
+
+        proxy_instances = [
+            "https://yewtu.be",
+            "https://invidious.snopyta.org",
+            "https://vid.puffyan.us",
+            "https://inv.nadeko.net",
+        ]
+        proxy_source = f"{random.choice(proxy_instances)}/watch?v={video_id}"
+        output_template = temp_path(f"yt_fallback_{video_id}.%(ext)s")
+
+        cmd = [
+            "yt-dlp",
+            "--no-check-certificate",
+            "--user-agent", DEFAULT_USER_AGENT,
+            "--referer", "https://www.youtube.com/",
+            "-f", "best[height<=720][ext=mp4]/best",
+            "--download-sections", section_spec,
+            "--force-keyframes-at-cuts",
+            "-o", output_template,
+            proxy_source,
+        ]
+
         if status_placeholder:
-            status_placeholder.info(f"🛡️ Downloading clipped segment via Cobalt ({attempt_label})...")
-
-        payload = {
-            "url": video_url,
-            "sectionStart": round(start_seconds, 3),
-            "sectionEnd": round(start_seconds + duration, 3),
-            "quality": quality_level,
-        }
-
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": DEFAULT_USER_AGENT,
-        }
+            status_placeholder.info("🛟 Cobalt failed; falling back to yt-dlp via proxy...")
 
         try:
-            api_response = requests.post(
-                "https://api.cobalt.tools/api/json",
-                json=payload,
-                headers=headers,
-                timeout=45,
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-        except requests.RequestException as e:
-            return False, f"Cobalt API request failed: {e}"
-
-        if api_response.status_code >= 400:
-            return False, f"Cobalt API HTTP {api_response.status_code}: {tail_text(api_response.text)}"
-
-        try:
-            api_data = api_response.json()
         except Exception as e:
-            return False, f"Invalid JSON from Cobalt API: {e}"
+            return False, f"yt-dlp fallback failed: {e}"
 
-        stream_url = extract_stream_url(api_data)
-        if not stream_url:
-            return False, f"Cobalt API did not return a stream URL: {tail_text(json.dumps(api_data, ensure_ascii=False), max_lines=5)}"
+        if proc.returncode != 0:
+            error_tail = tail_text("\n".join(part for part in [proc.stdout, proc.stderr] if part), max_lines=20)
+            return False, f"yt-dlp fallback HTTP/exec failure: {error_tail}"
 
-        try:
-            with requests.get(stream_url, stream=True, timeout=120) as download_response:
-                download_response.raise_for_status()
-                with open(temp_clip_path, "wb") as out_file:
-                    for chunk in download_response.iter_content(chunk_size=1024 * 256):
-                        if chunk:
-                            out_file.write(chunk)
-        except requests.RequestException as e:
-            return False, f"Failed to download stream from Cobalt URL: {e}"
-        except Exception as e:
-            return False, f"Failed saving clipped video: {e}"
+        candidate_files = sorted(TEMP_DIR.glob(f"yt_fallback_{video_id}*"), key=lambda item: item.stat().st_size if item.exists() else 0, reverse=True)
+        if not candidate_files:
+            return False, "yt-dlp fallback produced no output file."
 
-        if os.path.exists(temp_clip_path) and os.path.getsize(temp_clip_path) > 100000:
-            return True, ""
+        for candidate in candidate_files:
+            if candidate.is_file() and candidate.stat().st_size > 100000:
+                try:
+                    shutil.copyfile(candidate, temp_clip_path)
+                    cleanup_temp_files(f"yt_fallback_{video_id}")
+                    return True, ""
+                except Exception as e:
+                    return False, f"yt-dlp fallback save failed: {e}"
 
-        return False, "Cobalt finished but produced an empty/too-small clip."
+        cleanup_temp_files(f"yt_fallback_{video_id}")
+        return False, "yt-dlp fallback produced an empty/too-small clip."
 
-    # Step 1: Cobalt API clipping with quality fallback
     last_error = ""
-    for quality_level, attempt_label in [
-        (720, "quality 720"),
-        (480, "quality 480 fallback"),
-        (360, "quality 360 emergency fallback"),
-    ]:
-        success, error_tail = run_cobalt_download_attempt(quality_level, attempt_label)
+    if os.path.exists(temp_clip_path):
+        try:
+            os.remove(temp_clip_path)
+        except Exception:
+            pass
+
+    for quality_level in [720, 480, 360]:
+        success, error_tail = download_with_cobalt(
+            video_url=video_url,
+            start_time=start_seconds,
+            end_time=start_seconds + duration,
+            temp_clip_path=temp_clip_path,
+            quality_level=quality_level,
+            status_placeholder=status_placeholder,
+        )
         if success:
             last_error = ""
             break
@@ -1083,17 +1171,22 @@ def create_viral_short(
 
     if not os.path.exists(temp_clip_path) or os.path.getsize(temp_clip_path) == 0:
         if status_placeholder:
-            if last_error and "403" in last_error:
-                status_placeholder.error("❌ HTTP 403 Forbidden from upstream provider. Tried Cobalt fallback qualities but clip still failed.")
+            if last_error and ("403" in last_error or "400" in last_error):
+                status_placeholder.warning("⚠️ Cobalt failed. Trying yt-dlp proxy fallback...")
             else:
-                status_placeholder.error("❌ Cobalt API clipping failed on all quality attempts.")
-        if last_error:
-            st.code(last_error, language="text")
-        return None
+                status_placeholder.warning("⚠️ Cobalt API clipping failed. Trying yt-dlp proxy fallback...")
 
-    # Step 2: Save final clip directly (no heavy server-side reprocessing)
+        fallback_success, fallback_error = run_ytdlp_proxy_fallback()
+        if not fallback_success:
+            if status_placeholder:
+                status_placeholder.error("❌ Both Cobalt and yt-dlp fallback failed.")
+            st.session_state.last_yt_dlp_error = fallback_error or last_error
+            if st.session_state.last_yt_dlp_error:
+                st.code(st.session_state.last_yt_dlp_error, language="text")
+            return None
+
     if status_placeholder:
-        status_placeholder.info("✅ Clipped segment downloaded from Cobalt API")
+        status_placeholder.info("✅ Clipped segment downloaded")
 
     try:
         shutil.copyfile(temp_clip_path, output_file)
@@ -1101,6 +1194,12 @@ def create_viral_short(
         if status_placeholder:
             status_placeholder.error(f"❌ Failed to finalize clip file: {e}")
         return None
+    finally:
+        try:
+            if os.path.exists(temp_clip_path):
+                os.remove(temp_clip_path)
+        except Exception:
+            pass
 
     if progress_placeholder:
         progress_placeholder.success("✅ Clip ready for upload")
