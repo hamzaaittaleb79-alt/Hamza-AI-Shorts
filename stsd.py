@@ -162,22 +162,68 @@ def _parse_vtt_to_segments(vtt_text: str) -> List[Dict]:
     return transcript
 
 
+def _parse_json3_to_segments(json3_text: str) -> List[Dict]:
+    """Parse yt-dlp JSON3 subtitle text into transcript segments."""
+    try:
+        data = json.loads(json3_text)
+    except Exception:
+        return []
+
+    events = data.get("events") if isinstance(data, dict) else None
+    if not isinstance(events, list):
+        return []
+
+    transcript = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        start_ms = event.get("tStartMs")
+        duration_ms = event.get("dDurationMs") or event.get("durMs") or event.get("tDurationMs")
+        segments = event.get("segs") or []
+        if start_ms is None or not isinstance(segments, list):
+            continue
+
+        text_parts = []
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            text_value = str(segment.get("utf8", "")).replace("\n", " ").strip()
+            if text_value:
+                text_parts.append(text_value)
+
+        text = "".join(text_parts).strip()
+        if not text:
+            continue
+
+        transcript.append({
+            "text": text,
+            "start": float(start_ms) / 1000.0,
+            "duration": max(0.5, float(duration_ms or 5000) / 1000.0),
+        })
+
+    return transcript
+
+
 def _fetch_transcript_with_ytdlp(video_id: str) -> Optional[List[Dict]]:
     """Scout attempt: fetch auto subtitles with yt-dlp, then parse temp subtitle files."""
     video_url = f"https://www.youtube.com/watch?v={video_id}"
-    output_template = temp_path(f"yt_subs_{video_id}.%(ext)s")
+    output_template = temp_path(f"{video_id}.%(ext)s")
     cmd = [
         "yt-dlp",
         "--skip-download",
         "--write-auto-subs",
-        "--get-subs",
-        "--sub-langs", "all,-live_chat",
-        "--sub-format", "vtt",
+        "--sub-format", "json3/srt/vtt",
+        "--sub-langs", "en.*,ar.*",
         "--no-check-certificate",
-        "--user-agent", DEFAULT_USER_AGENT,
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "--referer", "https://www.youtube.com/",
         "-o", output_template,
         video_url,
     ]
+
+    expected_files = []
+    for ext in ("vtt", "json", "json3", "srt"):
+        expected_files.extend(TEMP_DIR.glob(f"{video_id}*.{ext}"))
 
     try:
         subprocess.run(
@@ -191,14 +237,14 @@ def _fetch_transcript_with_ytdlp(video_id: str) -> Optional[List[Dict]]:
     except Exception:
         return None
 
-    subtitle_files = sorted(TEMP_DIR.glob(f"yt_subs_{video_id}*.vtt"))
+    subtitle_files = sorted({*expected_files, *TEMP_DIR.glob(f"{video_id}*.vtt"), *TEMP_DIR.glob(f"{video_id}*.json"), *TEMP_DIR.glob(f"{video_id}*.json3"), *TEMP_DIR.glob(f"{video_id}*.srt")})
     if not subtitle_files:
         return None
 
     selected_file = None
     for file_path in subtitle_files:
         lower_name = file_path.name.lower()
-        if ".en." in lower_name or ".ar." in lower_name or ".fr." in lower_name:
+        if ".en." in lower_name or ".ar." in lower_name or ".en-" in lower_name or ".ar-" in lower_name:
             selected_file = file_path
             break
     if selected_file is None:
@@ -206,7 +252,10 @@ def _fetch_transcript_with_ytdlp(video_id: str) -> Optional[List[Dict]]:
 
     try:
         content = selected_file.read_text(encoding="utf-8", errors="ignore")
-        transcript = _parse_vtt_to_segments(content)
+        if selected_file.suffix.lower() in (".json", ".json3"):
+            transcript = _parse_json3_to_segments(content)
+        else:
+            transcript = _parse_vtt_to_segments(content)
         return transcript if transcript else None
     except Exception:
         return None
@@ -320,51 +369,6 @@ def _fetch_transcript_from_proxy(video_id: str) -> Optional[List[Dict]]:
     return None
 
 
-def _metadata_description_as_transcript(video_id: str) -> Optional[List[Dict]]:
-    """Fallback transcript built from video description (chapters/context)."""
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
-    try:
-        cmd = [
-            "yt-dlp",
-            "--dump-single-json",
-            "--skip-download",
-            "--no-check-certificate",
-            "--user-agent", DEFAULT_USER_AGENT,
-            video_url,
-        ]
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=25,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        if proc.returncode != 0 or not proc.stdout.strip():
-            return None
-
-        data = json.loads(proc.stdout)
-        description = str(data.get("description", "")).strip()
-        if not description:
-            return None
-
-        # Build transcript segments from description lines; chapter timestamps are preserved as text context.
-        lines = [line.strip() for line in description.splitlines() if line.strip()]
-        transcript = []
-        current_start = 0.0
-        for line in lines[:120]:
-            transcript.append({
-                "text": line,
-                "start": current_start,
-                "duration": 5.0,
-            })
-            current_start += 5.0
-
-        return transcript if transcript else None
-    except Exception:
-        return None
-
-
 def _get_transcript_smart_result(video_id: str) -> Tuple[Optional[List[Dict]], str]:
     """
     Lightweight cloud-based transcript fetcher.
@@ -381,10 +385,6 @@ def _get_transcript_smart_result(video_id: str) -> Tuple[Optional[List[Dict]], s
     proxy_transcript = _fetch_transcript_from_proxy(video_id)
     if proxy_transcript:
         return proxy_transcript, "proxy_captions"
-
-    description_transcript = _metadata_description_as_transcript(video_id)
-    if description_transcript:
-        return description_transcript, "description_backup"
 
     return None, "none"
 
@@ -1112,7 +1112,7 @@ def render_stage_1():
 
                             if not transcript or len(transcript) == 0:
                                 status_placeholder.update(label="⚠️ No transcript available", state="error")
-                                st.warning("تعذر استخراج النص من البروكسي والوصف. جرّب فيديو آخر أو أعد المحاولة لاحقاً.")
+                                st.warning("Try another video")
                             else:
                                 st.write(f"✅ Successfully fetched {len(transcript)} transcript segments!")
                                 st.session_state.video_id = video_id
