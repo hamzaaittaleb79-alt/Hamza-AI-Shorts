@@ -8,6 +8,10 @@ import tempfile
 import subprocess
 import time
 import io
+import secrets
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Dict
 import streamlit as st
@@ -34,19 +38,126 @@ DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 APP_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 TEMP_DIR = Path(tempfile.gettempdir())
 
-# Invidious-style API bases (client-side fetch from visitor IP — avoids blocked Streamlit egress).
-INVIDIOUS_API_HOSTS = [
-    "https://yewtu.be",
-    "https://invidious.projectlunar.party",
-    "https://inv.bp.projectsegfau.lt",
-    "https://inv.nadeko.net",
-    "https://vid.puffyan.us",
-]
-
-
 def get_ytdlp_proxy() -> Optional[str]:
     """Optional HTTP(S) proxy for yt-dlp on the server (e.g. residential proxy)."""
     return (os.getenv("YTDLP_PROXY") or os.getenv("STREAMLIT_YTDLP_PROXY") or "").strip() or None
+
+
+# ============= LOCAL STREAM PROXY (CORS bypass for browser fetch) =============
+# Works only when the user opens Streamlit on the same machine (localhost):
+# the browser can reach 127.0.0.1 where this daemon listens.
+# On Streamlit Community Cloud, set VIRAFLOW_DISABLE_STREAM_PROXY=1 — browser cannot reach container localhost.
+_PROXY_LOCK = threading.Lock()
+_PROXY_HTTPD: Optional[HTTPServer] = None
+_PROXY_PORT: Optional[int] = None
+_PROXY_REGISTRATIONS: Dict[str, Dict[str, Any]] = {}
+
+
+def stream_proxy_enabled() -> bool:
+    if (os.getenv("VIRAFLOW_DISABLE_STREAM_PROXY") or "").strip().lower() in ("1", "true", "yes"):
+        return False
+    if (os.getenv("VIRAFLOW_ENABLE_STREAM_PROXY") or "").strip().lower() in ("1", "true", "yes"):
+        return True
+    if (os.getenv("STREAMLIT_CLOUD") or "").strip():
+        return False
+    return True
+
+
+def _prune_proxy_registrations(max_entries: int = 48) -> None:
+    now = time.time()
+    dead = [k for k, v in _PROXY_REGISTRATIONS.items() if now > float(v.get("expires", 0))]
+    for k in dead:
+        _PROXY_REGISTRATIONS.pop(k, None)
+    if len(_PROXY_REGISTRATIONS) <= max_entries:
+        return
+    for k in list(_PROXY_REGISTRATIONS.keys())[: len(_PROXY_REGISTRATIONS) - max_entries]:
+        _PROXY_REGISTRATIONS.pop(k, None)
+
+
+class _StreamProxyHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_args, **_kwargs) -> None:
+        return
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Range, Content-Type")
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path != "/stream":
+            self.send_error(404)
+            return
+        qs = parse_qs(parsed.query)
+        token = (qs.get("token") or [None])[0]
+        if not token or token not in _PROXY_REGISTRATIONS:
+            self.send_error(404)
+            return
+        sess = _PROXY_REGISTRATIONS[token]
+        if time.time() > float(sess.get("expires", 0)):
+            _PROXY_REGISTRATIONS.pop(token, None)
+            self.send_error(404)
+            return
+        url = sess["url"]
+        cookies = sess["cookies"]
+        base_headers = dict(sess["headers"])
+        range_hdr = self.headers.get("Range")
+        req_headers = dict(base_headers)
+        if range_hdr:
+            req_headers["Range"] = range_hdr
+        try:
+            with requests.get(url, stream=True, headers=req_headers, cookies=cookies, timeout=180) as remote:
+                self.send_response(remote.status_code)
+                for header_key in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
+                    header_val = remote.headers.get(header_key)
+                    if header_val:
+                        self.send_header(header_key, header_val)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                for chunk in remote.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        self.wfile.write(chunk)
+        except Exception:
+            try:
+                self.send_error(502)
+            except Exception:
+                pass
+
+
+def _ensure_local_stream_proxy_server() -> Optional[int]:
+    global _PROXY_HTTPD, _PROXY_PORT
+    with _PROXY_LOCK:
+        if _PROXY_HTTPD is not None:
+            return _PROXY_PORT
+        try:
+            server = HTTPServer(("127.0.0.1", 0), _StreamProxyHandler)
+        except OSError:
+            return None
+        _PROXY_PORT = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        _PROXY_HTTPD = server
+        return _PROXY_PORT
+
+
+def register_stream_proxy_url(media_url: str, headers: Dict[str, str], cookies: Dict[str, str]) -> Optional[str]:
+    """Return a localhost URL the browser can fetch (CORS open) that streams from Python."""
+    if not stream_proxy_enabled():
+        return None
+    port = _ensure_local_stream_proxy_server()
+    if port is None:
+        return None
+    _prune_proxy_registrations()
+    token = secrets.token_urlsafe(32)
+    _PROXY_REGISTRATIONS[token] = {
+        "url": media_url,
+        "headers": headers,
+        "cookies": cookies,
+        "expires": time.time() + 900.0,
+    }
+    return f"http://127.0.0.1:{port}/stream?token={token}"
 
 
 def app_path(*parts: str) -> str:
@@ -2125,12 +2236,9 @@ CLIPPER_HTML_TEMPLATE = r"""
 <div id="vira-clip-root" style="font-family:system-ui,sans-serif;color:#efe7d6;background:#111;padding:14px;border-radius:10px;border:1px solid rgba(255,215,0,0.35);">
   <p id="vira-status" style="color:#ffd700;font-weight:600;margin:0 0 10px 0;">جاري تجهيز الواجهة في متصفحك…</p>
   <button id="vira-run" type="button" style="display:none;background:#ffd700;color:#0b0b0c;border:none;padding:10px 18px;border-radius:8px;font-weight:700;cursor:pointer;">
-    قص وتحميل المقطع في جهازي (ffmpeg.wasm)
+    ⬇️ تنزيل الملف (Blob) باسم مخصص
   </button>
   <video id="vira-preview" controls playsinline style="display:none;width:100%;max-width:520px;margin-top:12px;border-radius:8px;background:#000;"></video>
-  <div style="margin-top:10px;">
-    <a id="vira-dl" style="display:none;color:#ffd700;font-weight:600;" href="#" download="clip.mp4">⬇️ تنزيل المقطع MP4</a>
-  </div>
 </div>
 <script type="application/json" id="vira-clip-payload">__PAYLOAD_JSON__</script>
 <script type="module">
@@ -2138,115 +2246,66 @@ CLIPPER_HTML_TEMPLATE = r"""
   const elStatus = document.getElementById("vira-status");
   const elBtn = document.getElementById("vira-run");
   const elVid = document.getElementById("vira-preview");
-  const elDl = document.getElementById("vira-dl");
   let PAYLOAD;
   try {
     PAYLOAD = JSON.parse(document.getElementById("vira-clip-payload").textContent);
   } catch (e) {
-    elStatus.textContent = "خطأ في بيانات القص.";
+    elStatus.textContent = "خطأ في بيانات التحميل.";
     return;
   }
-  const { videoId, start, duration, hosts, serverDirectUrl } = PAYLOAD;
+  const directUrl = (PAYLOAD.directUrl || "").trim();
+  const proxyUrl = (PAYLOAD.proxyUrl || "").trim();
+  const fileName = (PAYLOAD.fileName || "download.mp4").trim();
 
-  async function pickCombinedMp4Url(data) {
-    const streams = data.formatStreams || [];
-    let best = null;
-    let bestRes = 0;
-    for (const s of streams) {
-      if (!s.url || !s.type) continue;
-      if (!String(s.type).includes("video/mp4")) continue;
-      const parts = String(s.resolution || "0").split("x");
-      const res = parseInt(parts[0], 10) || 0;
-      if (res >= bestRes) {
-        best = s;
-        bestRes = res;
-      }
-    }
-    return best ? best.url : null;
-  }
-
-  async function fetchVideoMeta(host, vid) {
-    const u = host.replace(/\/$/, "") + "/api/v1/videos/" + encodeURIComponent(vid);
-    const r = await fetch(u, { method: "GET" });
-    if (!r.ok) throw new Error(host + " HTTP " + r.status);
-    return r.json();
-  }
-
-  let streamUrl = null;
-  let streamSource = "";
-  if (serverDirectUrl) {
-    streamUrl = serverDirectUrl;
-    streamSource = "yt-dlp (السيرفر — قد لا يعمل إن كان IP محظوراً)";
-  }
-  if (!streamUrl) {
-    elStatus.textContent = "البحث عن رابط بث عبر Invidious من متصفحك (IP الزبون)…";
-    for (const h of hosts) {
-      try {
-        const meta = await fetchVideoMeta(h, videoId);
-        const u = await pickCombinedMp4Url(meta);
-        if (u) {
-          streamUrl = u;
-          streamSource = h;
-          break;
-        }
-      } catch (e) {
-        /* next host */
-      }
-    }
-  }
-  if (!streamUrl) {
+  if (!directUrl) {
     elStatus.textContent =
-      "تعذر الحصول على رابط بث. جرّب لاحقاً أو استخدم بروكسي للسيرفر (YTDLP_PROXY) ثم أعد تحميل الصفحة.";
+      "لا يوجد رابط مباشر بعد. اضغط «تحديث الرابط» في الصفحة أو تحقق من yt-dlp / الكوكيز / البروكسي.";
     return;
   }
 
   elStatus.textContent =
-    "المصدر: " +
-    streamSource +
-    ". اضغط الزر لتنزيل الفيديو إلى متصفحك وقصّه محلياً (قد يستغرق وقتاً للفيديوهات الطويلة).";
+    "الرابط جاهز من السيرفر. جرّب الزر: يُحمّل المتصفح البيانات كـ Blob (بدون ffmpeg). إذا منع CORS، يُستخدم بروكسي السيرفر المحلي عند توفره.";
   elBtn.style.display = "inline-block";
+
+  function triggerDownload(blobUrl, name) {
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = name || "video.mp4";
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
 
   elBtn.addEventListener("click", async () => {
     elBtn.disabled = true;
-    elStatus.textContent = "تحميل ffmpeg.wasm…";
+    let response = null;
+    let used = "";
     try {
-      const { FFmpeg } = await import("https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/+esm");
-      const { fetchFile, toBlobURL } = await import("https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/+esm");
-      const ffmpeg = new FFmpeg();
-      const base = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm";
-      await ffmpeg.load({
-        coreURL: await toBlobURL(`${base}/ffmpeg-core.js`, "text/javascript"),
-        wasmURL: await toBlobURL(`${base}/ffmpeg-core.wasm`, "application/wasm"),
-      });
-      elStatus.textContent = "تنزيل الملف إلى الذاكرة المحلية…";
-      await ffmpeg.writeFile("input.mp4", await fetchFile(streamUrl));
-      elStatus.textContent = "قص المقطع (-c copy)…";
-      await ffmpeg.exec([
-        "-i",
-        "input.mp4",
-        "-ss",
-        String(start),
-        "-t",
-        String(duration),
-        "-c",
-        "copy",
-        "-movflags",
-        "frag_keyframe+empty_moov",
-        "out.mp4",
-      ]);
-      const out = await ffmpeg.readFile("out.mp4");
-      const blob = new Blob([out], { type: "video/mp4" });
-      const url = URL.createObjectURL(blob);
-      elVid.src = url;
+      try {
+        elStatus.textContent = "محاولة جلب مباشر من المتصفح…";
+        response = await fetch(directUrl, { method: "GET", mode: "cors", credentials: "omit", cache: "no-store" });
+        if (!response.ok) throw new Error("direct HTTP " + response.status);
+        used = "مباشر";
+      } catch (e1) {
+        if (!proxyUrl) throw e1;
+        elStatus.textContent = "المباشر فشل (غالباً CORS). جلب عبر بروكسي السيرفر المحلي…";
+        response = await fetch(proxyUrl, { method: "GET", mode: "cors", credentials: "omit", cache: "no-store" });
+        if (!response.ok) throw new Error("proxy HTTP " + response.status);
+        used = "بروكسي";
+      }
+      elStatus.textContent = "بناء Blob من الاستجابة (" + used + ")… قد يستغرق وقتاً.";
+      const blob = await response.blob();
+      const burl = URL.createObjectURL(blob);
+      elVid.src = burl;
       elVid.style.display = "block";
-      elDl.href = url;
-      elDl.download = "viraflow_clip_" + videoId + ".mp4";
-      elDl.style.display = "inline";
-      elStatus.textContent = "تم القص في جهازك. يمكنك المعاينة أو التحميل.";
+      triggerDownload(burl, fileName);
+      elStatus.textContent = "تم إنشاء Blob وبدء التحميل باسم: " + fileName + " — يمكنك المعاينة أدناه.";
     } catch (e) {
       elStatus.textContent =
-        "فشل التنفيذ في المتصفح (CORS أو حظر الشبكة أو ffmpeg.wasm): " +
-        (e && e.message ? e.message : String(e));
+        "فشل التحميل في المتصفح: " +
+        (e && e.message ? e.message : String(e)) +
+        " — جرّب زر «تنزيل عبر السيرفر» أسفل الصفحة إن وُجد.";
       elBtn.disabled = false;
     }
   });
@@ -2256,19 +2315,15 @@ CLIPPER_HTML_TEMPLATE = r"""
 
 
 def build_client_side_clipper_html(
-    video_id: str,
-    start_sec: float,
-    end_sec: float,
-    server_direct_url: Optional[str] = None,
+    direct_url: str,
+    proxy_url: Optional[str],
+    download_filename: str,
 ) -> str:
-    """HTML/JS: fetch stream using visitor IP (Invidious API or optional server URL), clip with ffmpeg.wasm."""
-    duration = max(1.0, float(end_sec) - float(start_sec))
+    """HTML/JS: browser fetch direct URL, optional localhost stream proxy, Blob download."""
     payload = {
-        "videoId": video_id,
-        "start": float(start_sec),
-        "duration": float(duration),
-        "hosts": list(INVIDIOUS_API_HOSTS),
-        "serverDirectUrl": (server_direct_url or "").strip(),
+        "directUrl": (direct_url or "").strip(),
+        "proxyUrl": (proxy_url or "").strip(),
+        "fileName": download_filename or "viraflow_clip.mp4",
     }
     payload_json = json.dumps(payload, ensure_ascii=False)
     return CLIPPER_HTML_TEMPLATE.replace("__PAYLOAD_JSON__", payload_json)
@@ -2276,7 +2331,7 @@ def build_client_side_clipper_html(
 
 # ============= STAGE 3: CLIENT-SIDE CLIP (BYPASS BLOCKED SERVER IP) =============
 def render_stage_3():
-    """STAGE 3: Client-side fetch + ffmpeg.wasm; optional yt-dlp URL with proxy on server."""
+    """STAGE 3: yt-dlp direct URL + browser fetch/Blob; optional local stream proxy + server fallback."""
     st.markdown("### 🚀 المرحلة النهائية: قص في جهاز الزبون (تجاوز حظر IP السيرفر)")
 
     video_id = st.session_state.video_id
@@ -2300,9 +2355,9 @@ def render_stage_3():
 
     st.markdown("---")
     st.warning(
-        "سيرفر Streamlit غالباً **محظور من يوتيوب**. القص والتحميل أدناه يتم في **متصفح الزبون** عبر "
-        "Invidious API ثم **ffmpeg.wasm**، حتى لا يمرّ الفيديو عبر IP السيرفر. "
-        "يمكنك أيضاً ضبط المتغير `YTDLP_PROXY` أو `STREAMLIT_YTDLP_PROXY` ليستخدمه yt-dlp على السيرفر عند جلب رابط اختياري."
+        "**HTML5 + Blob:** السيرفر يجلب **رابط البث المباشر** فقط عبر `yt-dlp`، ثم المتصفح ينفّذ `fetch` من جهاز الزبون. "
+        "إذا منع **CORS**، يُفعّل **بروكسي تدفق محلي** على `127.0.0.1` (يعمل عند تشغيل Streamlit على جهازك؛ على السحابة عطّله عبر `VIRAFLOW_DISABLE_STREAM_PROXY=1`). "
+        "يمكن ضبط `YTDLP_PROXY` لمساعدة yt-dlp على السيرفر."
     )
 
     start_time = float(selected.get("start_time", 0.0))
@@ -2311,57 +2366,123 @@ def render_stage_3():
     start_seconds = max(0, int(start_time))
     end_seconds = max(start_seconds + 1, int(end_time))
 
-    proxy_active = get_ytdlp_proxy()
-    if proxy_active:
-        st.caption(
-            "بروكسي yt-dlp على السيرفر مفعّل (للزر الاختياري أدناه)."
-        )
-    else:
-        st.caption(
-            "لا يوجد بروكسي للسيرفر — زر «جلب الرابط من السيرفر» قد يفشل إن كان IP الحاوية محظوراً."
-        )
-
-    st.markdown("### 🎬 معاينة داخل الصفحة")
-    st.caption("شاهد اللقطة المختارة هنا، وللتحميل استخدم الصندوق أدناه (يعمل في جهازك).")
-    st.video(f"{video_url}&t={start_seconds}s")
-
     if "stage3_server_direct" not in st.session_state:
         st.session_state.stage3_server_direct = ""
-    if "stage3_direct_key" not in st.session_state:
-        st.session_state.stage3_direct_key = ""
+    if "stage3_segment_key" not in st.session_state:
+        st.session_state.stage3_segment_key = ""
+    if "stage3_ytdlp_err" not in st.session_state:
+        st.session_state.stage3_ytdlp_err = ""
+    if "stage3_server_blob" not in st.session_state:
+        st.session_state.stage3_server_blob = None
 
     segment_key = f"{video_id}:{start_seconds}:{end_seconds}"
-    if st.session_state.stage3_direct_key != segment_key:
-        st.session_state.stage3_direct_key = segment_key
-        st.session_state.stage3_server_direct = ""
+    if st.session_state.stage3_segment_key != segment_key:
+        st.session_state.stage3_segment_key = segment_key
+        st.session_state.stage3_server_blob = None
+        st.session_state.stage3_ytdlp_err = ""
+        with st.spinner("yt-dlp: جلب الرابط المباشر في الخلفية…"):
+            ok_u, u_or_err = get_direct_stream_url(video_url)
+            if ok_u:
+                st.session_state.stage3_server_direct = u_or_err
+            else:
+                st.session_state.stage3_server_direct = ""
+                st.session_state.stage3_ytdlp_err = u_or_err or ""
 
-    st.markdown("### 📥 وكيل خارجي: قص في المتصفح (ffmpeg.wasm)")
+    proxy_active = get_ytdlp_proxy()
+    if proxy_active:
+        st.caption("بروكسي yt-dlp على السيرفر مفعّل (`YTDLP_PROXY`).")
+    else:
+        st.caption("لا يوجد بروكسي لـ yt-dlp على السيرفر — قد يفشل جلب الرابط إن كان IP الحاوية محظوراً.")
+
+    if st.session_state.stage3_ytdlp_err and not st.session_state.stage3_server_direct:
+        st.error(st.session_state.stage3_ytdlp_err)
+
+    if stream_proxy_enabled():
+        st.caption("بروكسي التدفق المحلي (للمتصفح): **مفعّل** — يستخدمه الإطار عند فشل fetch المباشر.")
+    else:
+        st.caption("بروكسي التدفق المحلي: **معطّل** — يعتمد المتصفح على fetch المباشر فقط.")
+
+    st.markdown("### 🎬 معاينة داخل الصفحة")
+    st.caption("شاهد اللقطة المختارة هنا؛ التحميل النهائي عبر الزر الأصفر في الإطار أدناه (Blob).")
+    st.video(f"{video_url}&t={start_seconds}s")
+
+    st.markdown("### 📥 جلب الرابط (yt-dlp على السيرفر)")
     col_srv, col_clr = st.columns(2)
     with col_srv:
-        if st.button("جلب رابط مباشر من السيرفر (yt-dlp، مع بروكسي إن وُجد)", use_container_width=True):
-            with st.spinner("yt-dlp على السيرفر…"):
+        if st.button("تحديث الرابط (yt-dlp)", use_container_width=True):
+            with st.spinner("yt-dlp…"):
                 ok_u, u_or_err = get_direct_stream_url(video_url)
                 if ok_u:
                     st.session_state.stage3_server_direct = u_or_err
-                    st.success("تم تمرير الرابط للمتصفح في الإطار أدناه (قد يفشل بسبب CORS).")
+                    st.session_state.stage3_ytdlp_err = ""
+                    st.session_state.stage3_server_blob = None
+                    st.success("تم تحديث الرابط.")
                 else:
                     st.session_state.stage3_server_direct = ""
+                    st.session_state.stage3_ytdlp_err = u_or_err or ""
                     st.error(u_or_err)
     with col_clr:
-        if st.button("مسح رابط السيرفر", use_container_width=True):
+        if st.button("مسح الرابط المخزّن", use_container_width=True):
             st.session_state.stage3_server_direct = ""
+            st.session_state.stage3_server_blob = None
 
+    direct = (st.session_state.stage3_server_direct or "").strip()
+    proxy_stream: Optional[str] = None
+    if direct:
+        proxy_stream = register_stream_proxy_url(
+            direct,
+            headers={
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Referer": "https://www.youtube.com/",
+            },
+            cookies=load_requests_cookies_from_file(),
+        )
+
+    dl_name = f"viraflow_{video_id}_{start_seconds}_{end_seconds}.mp4"
     clip_html = build_client_side_clipper_html(
-        video_id=str(video_id),
-        start_sec=start_time,
-        end_sec=end_time,
-        server_direct_url=st.session_state.stage3_server_direct or None,
+        direct_url=direct,
+        proxy_url=proxy_stream,
+        download_filename=dl_name,
     )
-    st.components.v1.html(clip_html, height=720, scrolling=True)
+    st.components.v1.html(clip_html, height=420, scrolling=True)
+
+    st.markdown("### بديل: تنزيل كامل عبر السيرفر")
+    st.caption(
+        "إذا فشل المتصفح، يمكن تحميل الملف عبر السيرفر (يستهلك ذاكرة وقد يُحظر 403). "
+        "لا يوجد قص دقيق هنا — الملف كما يعيده الرابط المباشر."
+    )
+    if direct:
+        if st.button("تجهيز الملف على السيرفر للتنزيل", use_container_width=True, key="stage3_server_fetch"):
+            headers_dl = {
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Referer": "https://www.youtube.com/",
+            }
+            cookies_dl = load_requests_cookies_from_file()
+            try:
+                with st.spinner("تنزيل من الرابط المباشر على السيرفر…"):
+                    with requests.get(direct, stream=True, headers=headers_dl, cookies=cookies_dl, timeout=300) as r:
+                        r.raise_for_status()
+                        st.session_state.stage3_server_blob = b"".join(
+                            chunk for chunk in r.iter_content(chunk_size=256 * 1024) if chunk
+                        )
+                st.success("جاهز للتنزيل.")
+            except Exception as exc:
+                st.session_state.stage3_server_blob = None
+                st.error(f"فشل التنزيل على السيرفر: {exc}")
+
+    if st.session_state.stage3_server_blob:
+        st.download_button(
+            label="⬇️ تنزيل الملف (من السيرفر)",
+            data=st.session_state.stage3_server_blob,
+            file_name=dl_name,
+            mime="video/mp4",
+            use_container_width=True,
+            key="stage3_dl_server",
+        )
 
     st.caption(
-        f"توقيت اللقطة: من {start_seconds}s إلى {end_seconds}s | مدة القص: {int(clip_duration)}s — "
-        "التنزيل الكامل للملف في المتصفح قد يستغرق وقتاً للفيديوهات الطويلة."
+        f"توقيت اللقطة: من {start_seconds}s إلى {end_seconds}s | مدة القص (للمرجع): {int(clip_duration)}s — "
+        "تنزيل Blob يجلب عادة **الكامل** من الرابط المباشر (بدون قص في المتصفح)."
     )
 
 
