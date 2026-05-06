@@ -24,7 +24,7 @@ except ImportError:
 
 try:
     import urllib.request
-    from urllib.parse import urljoin
+    from urllib.parse import urljoin, quote_plus
 except ImportError:
     pass
 
@@ -2115,48 +2115,17 @@ def render_stage_3():
     start_seconds = max(0, int(start_time))
     end_seconds = max(start_seconds + 1, int(end_time))
 
-    st.info("⚡ السيرفر سيقص المقطع المطلوب مباشرة من يوتيوب ويرسله فورًا كملف MP4.")
+    quoted_video_url = quote_plus(video_url)
+    dirpy_link = f"https://dirpy.com/from/youtube?url={quoted_video_url}&start={start_seconds}&end={end_seconds}"
+    ytcutter_link = f"https://ytcutter.com/?url={quoted_video_url}&start={start_seconds}&end={end_seconds}"
+
+    st.warning("📥 السيرفر الحالي محظور من يوتيوب، اضغط هنا لفتح المقطع المقصوص جاهزاً للتحميل في ثوانٍ.")
+    st.markdown(f"[🚀 فتح المقطع مباشرة عبر Dirpy]({dirpy_link})")
+    st.markdown(f"[✂️ بديل سريع عبر YTCutter]({ytcutter_link})")
+
     st.markdown("### 🎬 معاينة داخل الصفحة")
-    st.video(f"{video_url}&t={start_seconds}s")
-
-    if "stage3_clip_bytes" not in st.session_state:
-        st.session_state.stage3_clip_bytes = None
-    if "stage3_clip_filename" not in st.session_state:
-        st.session_state.stage3_clip_filename = None
-    if "stage3_clip_key" not in st.session_state:
-        st.session_state.stage3_clip_key = None
-
-    clip_key = f"{video_id}:{start_seconds}:{end_seconds}:{selected_quality}"
-    if st.session_state.stage3_clip_key != clip_key:
-        st.session_state.stage3_clip_key = clip_key
-        st.session_state.stage3_clip_bytes = None
-        st.session_state.stage3_clip_filename = None
-
-    st.markdown("### 📥 تحميل MP4 (yt-dlp Piping)")
-    if st.button("⚡ جهّز القص المباشر للتحميل", use_container_width=True):
-        with st.spinner("جاري تحميل وقص المقطع عبر yt-dlp مباشرة إلى الذاكرة..."):
-            ok_clip, clip_buffer, clip_error = stream_clip_with_ytdlp_to_memory(
-                video_url=video_url,
-                start_time=start_time,
-                end_time=end_time,
-            )
-            if not ok_clip or clip_buffer is None:
-                st.error(clip_error or "فشل تجهيز المقطع.")
-            else:
-                st.session_state.stage3_clip_bytes = clip_buffer.getvalue()
-                st.session_state.stage3_clip_filename = f"viral_clip_{video_id}_{start_seconds}_{end_seconds}.mp4"
-                st.success("✅ المقطع جاهز. اضغط زر التحميل الآن.")
-
-    if st.session_state.stage3_clip_bytes:
-        st.markdown("### ▶️ معاينة المقطع الناتج")
-        st.video(st.session_state.stage3_clip_bytes)
-        st.download_button(
-            label="⬇️ تنزيل المقطع الآن",
-            data=io.BytesIO(st.session_state.stage3_clip_bytes),
-            file_name=st.session_state.stage3_clip_filename or "viral_clip.mp4",
-            mime="video/mp4",
-            use_container_width=True,
-        )
+    st.markdown("**شاهد اللقطة المختارة هنا، وللتحميل استخدم الزر أعلاه.**")
+    st.video(f"https://www.youtube.com/embed/{video_id}?start={start_seconds}&end={end_seconds}&autoplay=0")
 
     st.caption(f"توقيت اللقطة المقترح: من {start_seconds}s إلى {end_seconds}s | الجودة المختارة: {selected_quality} | مدة القص: {int(clip_duration)}s")
 
