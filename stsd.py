@@ -1464,16 +1464,13 @@ def create_viral_short(
     status_placeholder = None,
 ) -> Optional[str]:
     """
-    Production-grade short creation pipeline using direct yt-dlp download.
+    Extract direct streaming URL only (no server-side download/cutting).
 
-    Flow:
-    1. Download clipped segment مباشرة عبر yt-dlp
-    2. استخدام cookies.txt + User-Agent ثابت لتجاوز 403
-    3. Return final output path ready for upload
+    Strategy:
+    1. Use yt-dlp --get-url to fetch raw GoogleVideo URL
+    2. Keep cookies + real User-Agent + referer for fewer 403s
+    3. Return direct URL to let user download from their own device IP
     """
-    output_file = temp_path("final_viral_clip.mp4")
-    temp_clip_path = temp_path("temp_clip.mp4")
-
     start_seconds = max(0.0, float(start_time))
     duration = max(0.0, float(end_time) - float(start_time))
     if duration <= 0:
@@ -1482,117 +1479,59 @@ def create_viral_short(
         return None
 
     video_id = extract_video_id(video_url) or "video"
-    start_stamp = format_hhmmss(start_seconds)
-    end_stamp = format_hhmmss(start_seconds + duration)
-    section_spec = f"*{start_stamp}-{end_stamp}"
     cookies_path = app_path("cookies.txt")
+    input_url = video_url if video_url.startswith("http") else f"https://www.youtube.com/watch?v={video_id}"
+    format_selector = "best[height<=720][ext=mp4]/best"
+    quality_text = str(quality or "")
+    if "1080" in quality_text:
+        format_selector = "best[height<=1080][ext=mp4]/best"
+    elif "480" in quality_text:
+        format_selector = "best[height<=480][ext=mp4]/best"
 
-    def cleanup_temp_files(prefix: str) -> None:
-        for file_path in TEMP_DIR.glob(f"{prefix}*"):
-            try:
-                file_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    def run_ytdlp_direct_download() -> Tuple[bool, str]:
-        """Download clipped segment مباشرة من YouTube باستخدام yt-dlp + cookies.txt."""
-        cleanup_temp_files(f"yt_direct_{video_id}")
-        output_template = temp_path(f"yt_direct_{video_id}.%(ext)s")
-        input_url = video_url if video_url.startswith("http") else f"https://www.youtube.com/watch?v={video_id}"
-        format_selector = "best[height<=720][ext=mp4]/best"
-        quality_text = str(quality or "")
-        if "1080" in quality_text:
-            format_selector = "best[height<=1080][ext=mp4]/best"
-        elif "480" in quality_text:
-            format_selector = "best[height<=480][ext=mp4]/best"
-
-        cmd = [
-            "yt-dlp",
-            "--cookies", cookies_path,
-            "--no-check-certificate",
-            "--user-agent", DEFAULT_USER_AGENT,
-            "--referer", "https://www.youtube.com/",
-            "-f", format_selector,
-            "--download-sections", section_spec,
-            "--force-keyframes-at-cuts",
-            "-o", output_template,
-            input_url,
-        ]
-
-        if status_placeholder:
-            status_placeholder.info("⬇️ Downloading clipped segment مباشرة عبر yt-dlp + cookies.txt ...")
-
-        try:
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=180,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except Exception as e:
-            return False, f"yt-dlp direct download failed: {e}"
-
-        if proc.returncode != 0:
-            error_tail = store_yt_dlp_error(proc.stdout, proc.stderr)
-            return False, f"yt-dlp direct download error: {error_tail}"
-
-        candidate_files = sorted(
-            TEMP_DIR.glob(f"yt_direct_{video_id}*"),
-            key=lambda item: item.stat().st_size if item.exists() else 0,
-            reverse=True,
-        )
-        if not candidate_files:
-            return False, "yt-dlp direct download produced no output file."
-
-        for candidate in candidate_files:
-            if candidate.is_file() and candidate.stat().st_size > 100000:
-                try:
-                    shutil.copyfile(candidate, temp_clip_path)
-                    cleanup_temp_files(f"yt_direct_{video_id}")
-                    return True, ""
-                except Exception as e:
-                    return False, f"Failed saving direct clip: {e}"
-
-        cleanup_temp_files(f"yt_direct_{video_id}")
-        return False, "yt-dlp direct download produced an empty/too-small clip."
-
-    if os.path.exists(temp_clip_path):
-        try:
-            os.remove(temp_clip_path)
-        except Exception:
-            pass
-
-    direct_success, direct_error = run_ytdlp_direct_download()
-    if not direct_success:
-        if status_placeholder:
-            status_placeholder.error("❌ yt-dlp direct download failed.")
-        st.session_state.last_yt_dlp_error = direct_error
-        if st.session_state.last_yt_dlp_error:
-            st.code(st.session_state.last_yt_dlp_error, language="text")
-        return None
+    cmd = [
+        "yt-dlp",
+        "--get-url",
+        "--no-check-certificate",
+        "--user-agent", DEFAULT_USER_AGENT,
+        "--referer", "https://www.youtube.com/",
+        "-f", format_selector,
+        input_url,
+    ]
+    if os.path.exists(cookies_path):
+        cmd[1:1] = ["--cookies", cookies_path]
 
     if status_placeholder:
-        status_placeholder.info("✅ Clipped segment downloaded")
+        status_placeholder.info("🔗 جارٍ استخراج رابط التحميل المباشر...")
 
     try:
-        shutil.copyfile(temp_clip_path, output_file)
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=90,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
     except Exception as e:
         if status_placeholder:
-            status_placeholder.error(f"❌ Failed to finalize clip file: {e}")
+            status_placeholder.error(f"❌ فشل استخراج الرابط: {e}")
         return None
-    finally:
-        try:
-            if os.path.exists(temp_clip_path):
-                os.remove(temp_clip_path)
-        except Exception:
-            pass
+
+    if proc.returncode != 0:
+        error_tail = store_yt_dlp_error(proc.stdout, proc.stderr)
+        if status_placeholder:
+            status_placeholder.error("❌ تعذر استخراج الرابط المباشر من yt-dlp.")
+        st.session_state.last_yt_dlp_error = error_tail
+        return None
+
+    stream_candidates = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip().startswith("http")]
+    direct_url = stream_candidates[0] if stream_candidates else ""
+    if not direct_url:
+        return None
 
     if progress_placeholder:
-        progress_placeholder.success("✅ Clip ready for upload")
-
-    return output_file
+        progress_placeholder.success("✅ Direct link extracted")
+    return direct_url
 
 
 # ============= STAGE 1: INPUT & ANALYSIS =============
@@ -1809,8 +1748,8 @@ def render_stage_2():
 
 # ============= STAGE 3: DIRECT DOWNLOAD LINKS =============
 def render_stage_3():
-    """STAGE 3: Server-side clipping with yt-dlp, preview, and direct download."""
-    st.markdown("### 🚀 المرحلة النهائية: قص وتحميل مباشر")
+    """STAGE 3: Extract direct URL and let user download locally."""
+    st.markdown("### 🚀 المرحلة النهائية: رابط تحميل مباشر")
 
     video_id = st.session_state.video_id
     video_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -1832,7 +1771,7 @@ def render_stage_3():
             st.rerun()
 
     st.markdown("---")
-    st.markdown("### 📥 اختر جودة القص")
+    st.markdown("### 📥 اختر جودة الرابط")
     quality_choice = st.radio(
         "اختر جودة الفيديو",
         ["720p (موصى به)", "1080p (HD)", "480p (سريع)"],
@@ -1846,11 +1785,11 @@ def render_stage_3():
     }
     selected_quality = quality_map[quality_choice]
 
-    st.markdown("### ✂️ ابدأ القص")
-    if st.button("✂️ قص اللحظة الآن", use_container_width=True, type="primary", key="clip_now"):
+    st.markdown("### 🔗 استخراج الرابط")
+    if st.button("🔗 استخراج رابط التحميل", use_container_width=True, type="primary", key="clip_now"):
         status_placeholder = st.empty()
-        with st.spinner("جاري قص اللحظة الذهبية..."):
-            output_path = create_viral_short(
+        with st.spinner("جاري تجهيز رابط التحميل المباشر..."):
+            direct_url = create_viral_short(
                 video_url=video_url,
                 start_time=float(selected.get("start_time", 0.0)),
                 end_time=float(selected.get("end_time", float(selected.get("start_time", 0.0)) + 45.0)),
@@ -1859,32 +1798,40 @@ def render_stage_3():
                 status_placeholder=status_placeholder,
             )
 
-        if output_path and os.path.exists(output_path):
-            st.session_state.output_video = output_path
-            st.success("✅ تم قص اللقطة بنجاح!")
+        if direct_url:
+            st.session_state.download_link = direct_url
+            st.success("✅ تم استخراج رابط التحميل المباشر!")
         else:
-            st.session_state.output_video = None
-            st.error("❌ فشل قص اللقطة. تحقق من cookies.txt وحاول مرة أخرى.")
+            st.session_state.download_link = None
+            st.error("❌ فشل استخراج الرابط. يمكنك المحاولة مجددًا.")
 
-    output_video = st.session_state.get("output_video")
-    if output_video and os.path.exists(output_video):
+    direct_link = st.session_state.get("download_link")
+    if direct_link:
         st.markdown("---")
-        st.markdown("### 🎬 معاينة الفيديو")
-        st.video(output_video)
+        st.markdown("### 📌 تعليمات القص للمستخدم")
+        st.info(
+            f"ابدأ التحميل/القص من التوقيت: {selected.get('timestamp', '00:00')} "
+            f"ولمدة تقريبية {int(max(1, float(selected.get('end_time', 45.0)) - float(selected.get('start_time', 0.0))))} ثانية."
+        )
+        st.link_button(
+            "📥 اضغط هنا للتحميل المباشر من جهازك",
+            url=direct_link,
+            use_container_width=True,
+        )
+        st.markdown("أو انسخ الرابط يدويًا:")
+        st.code(direct_link, language="text")
 
-        try:
-            with open(output_video, "rb") as file_handle:
-                video_bytes = file_handle.read()
-            clip_filename = f"viral_short_{video_id}_{selected.get('timestamp', '00-00').replace(':', '-')}_{selected_quality}.mp4"
-            st.download_button(
-                "⬇️ تحميل الفيديو مباشرة",
-                data=video_bytes,
-                file_name=clip_filename,
-                mime="video/mp4",
+        cobalt_ok, cobalt_link = get_cobalt_direct_download_link(
+            video_url=video_url,
+            quality_level=1080 if "1080" in selected_quality else (480 if "480" in selected_quality else 720),
+            status_placeholder=None,
+        )
+        if cobalt_ok and cobalt_link:
+            st.link_button(
+                "⚡ بديل سريع عبر Cobalt",
+                url=cobalt_link,
                 use_container_width=True,
             )
-        except Exception as e:
-            st.error(f"❌ تعذر تجهيز التحميل: {e}")
 
 
 # ============= MAIN APP FLOW =============
