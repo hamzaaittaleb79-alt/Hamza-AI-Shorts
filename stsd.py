@@ -168,12 +168,9 @@ def _normalize_transcript_segments(raw_segments: List[Dict]) -> List[Dict]:
 
 
 def _normalize_transcript_text(text: str) -> str:
-    """Remove subtitle tags, merge smushed words, and collapse whitespace."""
+    """Keep raw transcript text and only normalize whitespace/tags safely."""
     cleaned_text = re.sub(r"<[^>]+>", " ", text or "")
-    cleaned_text = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?(?:[\.,]\d{1,3})?\b", " ", cleaned_text)
-    cleaned_text = re.sub(r"(?<=[a-zA-Z])(?=[A-Z])", " ", cleaned_text)
-    cleaned_text = re.sub(r"(?<=[a-zA-Z])(?=\d)", " ", cleaned_text)
-    cleaned_text = re.sub(r"(?<=\d)(?=[a-zA-Z])", " ", cleaned_text)
+    cleaned_text = cleaned_text.replace("\r", " ").replace("\n", " ")
     cleaned_text = re.sub(r"\s+", " ", cleaned_text)
     return cleaned_text.strip()
 
@@ -877,8 +874,123 @@ def _repunctuate_transcript(transcript: List[Dict]) -> List[Dict]:
 
 def analyze_with_ai(transcript: List[Dict], custom_keywords: Optional[List[str]] = None, top_n: int = 3) -> List[Dict]:
     """Primary AI analysis entry point for transcript-driven viral moment detection."""
+    if not transcript:
+        return []
+
+    def _looks_english_text(text: str) -> bool:
+        letters = re.findall(r"[A-Za-z]", text or "")
+        if not letters:
+            return False
+        non_space_chars = re.findall(r"\S", text or "")
+        return len(letters) >= max(20, int(len(non_space_chars) * 0.45))
+
+    def _analyze_with_openai(raw_transcript: List[Dict]) -> Optional[List[Dict]]:
+        if not HAS_OPENAI:
+            return None
+
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            return None
+
+        transcript_text = format_transcript(raw_transcript, show_timestamps=True)
+        is_english = _looks_english_text(transcript_text)
+        keyword_text = ", ".join(custom_keywords or [])
+
+        system_prompt = (
+            "You are an expert short-form video editor and viral content analyst. "
+            "Analyze the ORIGINAL RAW transcript only. Do not translate transcript text, do not rewrite transcript lines, "
+            "and keep timestamps grounded in the provided transcript format [MM:SS] Text."
+        )
+        user_prompt = f"""
+Analyze this raw transcript and extract exactly {top_n} best viral moments.
+
+Rules:
+1) Use the original transcript text and timestamps exactly as context.
+2) Pick clips likely to perform strongly on TikTok/Reels/Shorts.
+3) Return strict JSON array only, each item with keys:
+   - title_ar (string)
+   - title_en (string)
+   - timestamp (MM:SS)
+   - start_time (number, seconds)
+   - end_time (number, seconds)
+   - viral_score (number 0-100)
+   - snippet (string, short excerpt from original transcript)
+4) If transcript language is English, provide both Arabic and English titles.
+5) If transcript language is not English, still provide both Arabic and English titles when possible.
+6) Do not return markdown, explanations, or any text outside JSON.
+
+Custom keywords priority: {keyword_text if keyword_text else "none"}
+Detected English transcript: {"yes" if is_english else "no"}
+
+RAW TRANSCRIPT:
+{transcript_text}
+"""
+        try:
+            client = OpenAI(api_key=api_key)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0.2,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            raw_content = (response.choices[0].message.content or "").strip()
+            if not raw_content:
+                return None
+
+            cleaned_json = raw_content
+            fenced_match = re.search(r"```(?:json)?\s*(.*?)\s*```", raw_content, re.DOTALL)
+            if fenced_match:
+                cleaned_json = fenced_match.group(1).strip()
+
+            parsed = json.loads(cleaned_json)
+            if not isinstance(parsed, list):
+                return None
+
+            normalized: List[Dict] = []
+            for item in parsed[:top_n]:
+                if not isinstance(item, dict):
+                    continue
+                title_ar = str(item.get("title_ar", "")).strip()
+                title_en = str(item.get("title_en", "")).strip()
+                title = f"{title_ar} | {title_en}".strip(" |")
+                timestamp = str(item.get("timestamp", "00:00")).strip()
+                start_time = float(item.get("start_time", 0.0) or 0.0)
+                end_time = float(item.get("end_time", start_time + 45.0) or (start_time + 45.0))
+                if end_time <= start_time:
+                    end_time = start_time + 45.0
+                viral_score = float(item.get("viral_score", 50.0) or 50.0)
+                snippet = _normalize_transcript_text(str(item.get("snippet", "")))
+                normalized.append({
+                    "title": title if title else "Viral Moment | لقطة فيروسية",
+                    "title_ar": title_ar,
+                    "title_en": title_en,
+                    "timestamp": timestamp,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "viral_score": max(0.0, min(100.0, viral_score)),
+                    "snippet": snippet,
+                })
+
+            return normalized if normalized else None
+        except Exception:
+            return None
+
+    ai_moments = _analyze_with_openai(transcript)
+    if ai_moments:
+        return ai_moments
+
     repunctuated_transcript = _repunctuate_transcript(transcript)
-    return find_viral_moments(repunctuated_transcript, custom_keywords=custom_keywords, top_n=top_n)
+    fallback = find_viral_moments(repunctuated_transcript, custom_keywords=custom_keywords, top_n=top_n)
+    # Keep bilingual titles in fallback path when transcript is mostly English.
+    if _looks_english_text(format_transcript(transcript, show_timestamps=False)):
+        for moment in fallback:
+            en_title = str(moment.get("title", "Viral Clip")).strip()
+            moment["title_en"] = en_title
+            moment["title_ar"] = "لقطة فيروسية"
+            moment["title"] = f"{moment['title_ar']} | {moment['title_en']}"
+    return fallback
 
 
 def format_hhmmss(seconds_value: float) -> str:
