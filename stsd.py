@@ -1465,112 +1465,57 @@ def create_viral_short(
     status_placeholder = None,
 ) -> Optional[Dict[str, str]]:
     """
-    Plan A: clip locally with yt-dlp format 18 within 10s.
-    Plan B: return direct full video URL via yt-dlp -g.
+    Clip directly from source using yt-dlp + ffmpeg downloader.
     """
     start_seconds = max(0.0, float(start_time))
     duration = max(0.0, float(end_time) - float(start_time))
     if duration <= 0:
-        if status_placeholder:
-            status_placeholder.error("❌ Invalid duration")
         return None
 
-    video_id = extract_video_id(video_url) or "video"
-    input_url = video_url if video_url.startswith("http") else f"https://www.youtube.com/watch?v={video_id}"
-    section_spec = f"*{format_hhmmss(start_seconds)}-{format_hhmmss(start_seconds + duration)}"
+    output_file = temp_path("short_clip.mp4")
+    input_url = video_url if video_url.startswith("http") else f"https://www.youtube.com/watch?v={extract_video_id(video_url) or ''}"
+    start_stamp = format_hhmmss(start_seconds)
+    end_stamp = format_hhmmss(start_seconds + duration)
 
-    def cleanup_old_tmp_files(max_age_seconds: int = 3600) -> None:
-        now_ts = time.time()
-        for item in TEMP_DIR.glob("fallback_clip_*"):
-            try:
-                if item.is_file() and (now_ts - item.stat().st_mtime) > max_age_seconds:
-                    item.unlink(missing_ok=True)
-            except Exception:
-                pass
+    try:
+        if os.path.exists(output_file):
+            os.remove(output_file)
+    except Exception:
+        pass
 
-    cleanup_old_tmp_files(max_age_seconds=3600)
-
-    def ytdlp_download_clipped() -> Optional[str]:
-        output_template = temp_path(f"fallback_clip_{video_id}_18.%(ext)s")
-        cmd = [
-            "yt-dlp",
-            "--no-check-certificate",
-            "--user-agent", DEFAULT_USER_AGENT,
-            "--referer", "https://www.youtube.com/",
-            "--limit-rate", "3M",
-            "-f", "18",
-            "--download-sections", section_spec,
-            "--force-keyframes-at-cuts",
-            "-o", output_template,
-            input_url,
-        ]
-
-        # Read cookies dynamically on every new attempt.
-        current_cookies_path = app_path("cookies.txt")
-        if os.path.exists(current_cookies_path):
-            cmd[1:1] = ["--cookies", current_cookies_path]
-
-        if shutil.which("aria2c"):
-            cmd[1:1] = ["--external-downloader", "aria2c"]
-
-        try:
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=10,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if proc.returncode != 0:
-                store_yt_dlp_error(proc.stdout, proc.stderr)
-                return None
-        except Exception:
-            return None
-
-        candidates = sorted(
-            TEMP_DIR.glob(f"fallback_clip_{video_id}_18*"),
-            key=lambda p: p.stat().st_size if p.exists() else 0,
-            reverse=True,
-        )
-        for item in candidates:
-            if item.is_file() and item.stat().st_size > 100000:
-                return str(item)
-        return None
-
-    local_clip = ytdlp_download_clipped()
-    if local_clip:
-        return {"mode": "clip", "value": local_clip}
-
-    # Plan B: direct full video URL.
-    get_url_cmd = [
+    cmd = [
         "yt-dlp",
-        "-g",
         "--no-check-certificate",
         "--user-agent", DEFAULT_USER_AGENT,
         "--referer", "https://www.youtube.com/",
-        "-f", "18/best",
+        "--downloader", "ffmpeg",
+        "--downloader-args", f"ffmpeg:-ss {start_stamp} -to {end_stamp} -c copy",
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "-o", output_file,
         input_url,
     ]
     current_cookies_path = app_path("cookies.txt")
     if os.path.exists(current_cookies_path):
-        get_url_cmd[1:1] = ["--cookies", current_cookies_path]
+        cmd[1:1] = ["--cookies", current_cookies_path]
+
     try:
         proc = subprocess.run(
-            get_url_cmd,
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=10,
+            timeout=120,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        if proc.returncode == 0:
-            urls = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip().startswith("http")]
-            if urls:
-                return {"mode": "direct", "value": urls[0]}
     except Exception:
-        pass
+        return None
 
+    if proc.returncode != 0:
+        store_yt_dlp_error(proc.stdout, proc.stderr)
+        return None
+
+    if os.path.exists(output_file) and os.path.getsize(output_file) > 100000:
+        return {"mode": "clip", "value": output_file}
     return None
 
 
@@ -1842,8 +1787,6 @@ def render_stage_3():
         if result and result.get("mode") == "clip" and os.path.exists(result.get("value", "")):
             st.session_state.output_video = result["value"]
             st.success("✅ تم تجهيز الفيديو المقصوص بنجاح!")
-        elif result and result.get("mode") == "direct":
-            st.session_state.download_link = result["value"]
         else:
             st.error("❌ تعذر تجهيز المقطع حالياً.")
 
@@ -1867,21 +1810,8 @@ def render_stage_3():
         except Exception as e:
             st.error(f"❌ تعذر تجهيز التحميل المحلي: {e}")
 
-    direct_link = st.session_state.get("download_link")
-    if direct_link:
-        st.warning("📥 تعذر القص آلياً، يمكنك تحميل الفيديو كاملاً عبر هذا الرابط المباشر")
-        st.link_button(
-            "📥 تحميل الفيديو الكامل",
-            url=direct_link,
-            use_container_width=True,
-        )
-
-    st.markdown("---")
-    st.link_button(
-        "🆘 فتح الفيديو يدوياً في Cobalt.tools",
-        url=f"https://cobalt.tools/?u={video_url}",
-        use_container_width=True,
-    )
+    if not output_video:
+        st.info("جرّب لقطة أخرى أو أعد المحاولة بعد لحظات.")
 
 
 # ============= MAIN APP FLOW =============
