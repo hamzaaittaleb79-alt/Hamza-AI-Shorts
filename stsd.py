@@ -103,7 +103,7 @@ def _normalize_transcript_segments(raw_segments: List[Dict]) -> List[Dict]:
     """Normalize transcript segments into the app's expected structure."""
     normalized = []
     for index, segment in enumerate(raw_segments or []):
-        text = str(segment.get("text", "")).replace("\n", " ").strip()
+        text = _normalize_transcript_text(str(segment.get("text", "")))
         if not text:
             continue
         start_value = float(segment.get("start", index * 5.0) or index * 5.0)
@@ -114,6 +114,17 @@ def _normalize_transcript_segments(raw_segments: List[Dict]) -> List[Dict]:
             "duration": duration_value,
         })
     return normalized
+
+
+def _normalize_transcript_text(text: str) -> str:
+    """Remove subtitle tags, merge smushed words, and collapse whitespace."""
+    cleaned_text = re.sub(r"<[^>]+>", " ", text or "")
+    cleaned_text = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?(?:[\.,]\d{1,3})?\b", " ", cleaned_text)
+    cleaned_text = re.sub(r"(?<=[a-zA-Z])(?=[A-Z])", " ", cleaned_text)
+    cleaned_text = re.sub(r"(?<=[a-zA-Z])(?=\d)", " ", cleaned_text)
+    cleaned_text = re.sub(r"(?<=\d)(?=[a-zA-Z])", " ", cleaned_text)
+    cleaned_text = re.sub(r"\s+", " ", cleaned_text)
+    return cleaned_text.strip()
 
 
 def _parse_vtt_to_segments(vtt_text: str) -> List[Dict]:
@@ -149,7 +160,7 @@ def _parse_vtt_to_segments(vtt_text: str) -> List[Dict]:
         if line.isdigit():
             continue
 
-        clean_text = re.sub(r"<[^>]+>", "", line).strip()
+        clean_text = _normalize_transcript_text(line)
         if not clean_text:
             continue
 
@@ -187,11 +198,11 @@ def _parse_json3_to_segments(json3_text: str) -> List[Dict]:
         for segment in segments:
             if not isinstance(segment, dict):
                 continue
-            text_value = str(segment.get("utf8", "")).replace("\n", " ").strip()
+            text_value = _normalize_transcript_text(str(segment.get("utf8", "")))
             if text_value:
                 text_parts.append(text_value)
 
-        text = "".join(text_parts).strip()
+        text = " ".join(text_parts).strip()
         if not text:
             continue
 
@@ -256,6 +267,15 @@ def _fetch_transcript_with_ytdlp(video_id: str) -> Optional[List[Dict]]:
             transcript = _parse_json3_to_segments(content)
         else:
             transcript = _parse_vtt_to_segments(content)
+        transcript = [
+            {
+                "text": _normalize_transcript_text(segment.get("text", "")),
+                "start": float(segment.get("start", 0.0) or 0.0),
+                "duration": float(segment.get("duration", 5.0) or 5.0),
+            }
+            for segment in transcript
+            if _normalize_transcript_text(segment.get("text", ""))
+        ]
         return transcript if transcript else None
     except Exception:
         return None
@@ -391,7 +411,17 @@ def _get_transcript_smart_result(video_id: str) -> Tuple[Optional[List[Dict]], s
 
 def get_transcript_smart(video_id: str) -> Optional[List[Dict]]:
     transcript, _source = _get_transcript_smart_result(video_id)
-    return transcript
+    if not transcript:
+        return None
+    return [
+        {
+            "text": _normalize_transcript_text(segment.get("text", "")),
+            "start": float(segment.get("start", 0.0) or 0.0),
+            "duration": float(segment.get("duration", 5.0) or 5.0),
+        }
+        for segment in transcript
+        if _normalize_transcript_text(segment.get("text", ""))
+    ]
 
 
 # ============= PAGE CONFIG & STYLING =============
@@ -749,9 +779,48 @@ def find_viral_moments(
     return moments[:top_n]
 
 
+def _repunctuate_transcript(transcript: List[Dict]) -> List[Dict]:
+    """Break dense transcript blocks into cleaner sentence-like segments before AI scoring."""
+    if not transcript:
+        return []
+
+    merged_text = " ".join(_normalize_transcript_text(seg.get("text", "")) for seg in transcript if _normalize_transcript_text(seg.get("text", "")))
+    if not merged_text:
+        return []
+
+    merged_text = re.sub(r"\s+", " ", merged_text).strip()
+    if len(merged_text) < 120:
+        return [{
+            "text": merged_text.strip(),
+            "start": float(transcript[0].get("start", 0.0) or 0.0),
+            "duration": float(transcript[0].get("duration", 5.0) or 5.0),
+        }]
+
+    sentence_candidates = re.split(r"(?<=[.!?])\s+|(?<=\))\s+", merged_text)
+    sentence_candidates = [sentence.strip() for sentence in sentence_candidates if sentence and sentence.strip()]
+
+    if not sentence_candidates:
+        sentence_candidates = [merged_text]
+
+    repunctuated = []
+    start_time = float(transcript[0].get("start", 0.0) or 0.0)
+    for index, sentence in enumerate(sentence_candidates):
+        cleaned_sentence = sentence.strip()
+        if not cleaned_sentence:
+            continue
+        repunctuated.append({
+            "text": cleaned_sentence,
+            "start": start_time + index * 5.0,
+            "duration": 5.0,
+        })
+
+    return repunctuated if repunctuated else transcript
+
+
 def analyze_with_ai(transcript: List[Dict], custom_keywords: Optional[List[str]] = None, top_n: int = 3) -> List[Dict]:
     """Primary AI analysis entry point for transcript-driven viral moment detection."""
-    return find_viral_moments(transcript, custom_keywords=custom_keywords, top_n=top_n)
+    repunctuated_transcript = _repunctuate_transcript(transcript)
+    return find_viral_moments(repunctuated_transcript, custom_keywords=custom_keywords, top_n=top_n)
 
 
 def format_hhmmss(seconds_value: float) -> str:
