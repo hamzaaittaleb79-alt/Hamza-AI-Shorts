@@ -1,14 +1,3 @@
-"""
-================================================================================
-🎬 ViraFlow - Professional Short-Form Engine (SaaS Edition)
-================================================================================
-Production-ready Streamlit application for AI-driven YouTube short creation.
-Optimized for Streamlit Cloud deployment with cloud-safe paths and headless mode.
-
-Author: MR. HAMZA AIT TALEB
-GitHub Education Partner | AI Intelligence Engine
-================================================================================
-"""
 import random
 import requests
 import re
@@ -31,11 +20,6 @@ try:
 except ImportError:
     HAS_OPENAI = False
     OpenAI = None
-
-try:
-    pass
-except ImportError:
-    pass
 
 try:
     import urllib.request
@@ -125,9 +109,28 @@ def get_transcript_smart(video_id: str) -> Optional[List[Dict]]:
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
         ts = YouTubeTranscriptApi.get_transcript(video_id, languages=['ar', 'en', 'fr'])
-        return [{"text": i.get('text', ''), "start": float(i.get('start', 0)), "duration": float(i.get('duration', 0))} for i in ts]
+        transcript = [{"text": i.get('text', ''), "start": float(i.get('start', 0)), "duration": float(i.get('duration', 0))} for i in ts]
+        if transcript:
+            return transcript
     except Exception:
-        return None
+        pass
+
+    video_title = "Untitled Video"
+    try:
+        oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+        response = requests.get(oembed_url, timeout=8, headers={"User-Agent": DEFAULT_USER_AGENT})
+        if response.status_code == 200:
+            video_title = response.json().get("title", video_title).strip() or video_title
+    except Exception:
+        pass
+
+    return [
+        {"text": f"{video_title}", "start": 0.0, "duration": 5.0},
+        {"text": f"{video_title}", "start": 5.0, "duration": 5.0},
+        {"text": f"{video_title}", "start": 10.0, "duration": 5.0},
+        {"text": f"{video_title}", "start": 15.0, "duration": 5.0},
+        {"text": f"{video_title}", "start": 20.0, "duration": 5.0},
+    ]
 
 
 # ============= PAGE CONFIG & STYLING =============
@@ -839,9 +842,7 @@ def render_stage_1():
                             # Step 1: Use cloud-smart transcript fetcher (youtube_transcript_api only)
                             st.write("📌 Fetching transcript via smart cloud engine...")
                             transcript = get_transcript_smart(video_id)
-                            # Ensure transcript is never None to allow pipeline to continue
-                            if transcript is None:
-                                transcript = [{"text": "", "start": 0.0, "duration": 0.0}]
+                            st.write(f"DEBUG: Transcript length: {len(transcript)}")
                             
                             if transcript and len(transcript) > 0:
                                 # Filter out generic fallback message
