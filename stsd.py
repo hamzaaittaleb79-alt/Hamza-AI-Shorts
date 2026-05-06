@@ -1726,22 +1726,38 @@ def stream_clip_with_ytdlp_to_memory(
     end_time: float,
 ) -> Tuple[bool, Optional[io.BytesIO], str]:
     """
-    Primary strategy: yt-dlp clips and streams MP4 to stdout, then BytesIO.
+    Primary strategy: yt-dlp + external ffmpeg clip into temp file, then BytesIO.
     """
     start_value = max(0.0, float(start_time))
     end_value = max(start_value + 1.0, float(end_time))
+    duration_value = end_value - start_value
     section_spec = f"*{format_hhmmss(start_value)}-{format_hhmmss(end_value)}"
+    downloader_args = f"ffmpeg:-ss {format_hhmmss(start_value)} -t {format_hhmmss(duration_value)} -c copy"
+    temp_output_path = Path("/tmp/temp_clip.mp4")
+    if not temp_output_path.parent.exists():
+        temp_output_path = Path(temp_path("temp_clip.mp4"))
+    output_file = str(temp_output_path)
+
+    try:
+        if os.path.exists(output_file):
+            os.remove(output_file)
+    except Exception:
+        pass
+
     cmd = [
         "yt-dlp",
         "--no-check-certificate",
         "--quiet",
         "--no-warnings",
         "--no-progress",
-        "--user-agent", DEFAULT_USER_AGENT,
+        "--client-name", "android_vr",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "--download-sections", section_spec,
-        "--force-keyframes-at-cuts",
+        "--external-downloader", "ffmpeg",
+        "--downloader-args", downloader_args,
+        "--force-overwrites",
         "-f", "best[ext=mp4]/best",
-        "-o", "-",
+        "-o", output_file,
         video_url,
     ]
     cookies_path = app_path("cookies.txt")
@@ -1749,40 +1765,37 @@ def stream_clip_with_ytdlp_to_memory(
         cmd[1:1] = ["--cookies", cookies_path]
 
     try:
-        proc = subprocess.Popen(
+        proc = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            timeout=300,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except Exception as exc:
         return False, None, f"فشل تشغيل yt-dlp: {exc}"
 
-    clip_buffer = io.BytesIO()
-    try:
-        if proc.stdout is None:
-            return False, None, "تعذر فتح stdout من yt-dlp."
-        while True:
-            chunk = proc.stdout.read(1024 * 256)
-            if not chunk:
-                break
-            clip_buffer.write(chunk)
-        _stdout_tail, stderr_data = proc.communicate(timeout=300)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        _stdout_tail, stderr_data = proc.communicate()
-        ytdlp_tail = tail_text((stderr_data or b"").decode("utf-8", errors="ignore"), max_lines=20)
-        return False, None, f"انتهت مهلة yt-dlp أثناء القص: {ytdlp_tail or 'Timeout'}"
-    except Exception as exc:
-        proc.kill()
-        return False, None, f"تعذر قراءة تدفق yt-dlp: {exc}"
-
     if proc.returncode != 0:
-        ytdlp_tail = tail_text((stderr_data or b"").decode("utf-8", errors="ignore"), max_lines=20)
+        ytdlp_tail = tail_text((proc.stderr or b"").decode("utf-8", errors="ignore"), max_lines=20)
         return False, None, f"فشل yt-dlp أثناء قص المقطع: {ytdlp_tail or 'Unknown error'}"
-    if clip_buffer.tell() == 0:
-        return False, None, "yt-dlp لم يرجع بيانات MP4."
 
+    if not os.path.exists(output_file):
+        return False, None, "yt-dlp انتهى لكن لم يُنشئ الملف المؤقت."
+    if os.path.getsize(output_file) <= 0:
+        return False, None, "الملف المؤقت الناتج فارغ."
+
+    try:
+        with open(output_file, "rb") as generated_clip:
+            clip_bytes = generated_clip.read()
+    except Exception as exc:
+        return False, None, f"تعذر قراءة الملف المؤقت: {exc}"
+    finally:
+        try:
+            os.remove(output_file)
+        except Exception:
+            pass
+
+    clip_buffer = io.BytesIO(clip_bytes)
     clip_buffer.seek(0)
     return True, clip_buffer, ""
 
