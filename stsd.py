@@ -1463,14 +1463,10 @@ def create_viral_short(
     quality: str = "720p",
     progress_placeholder = None,
     status_placeholder = None,
-) -> Optional[str]:
+) -> Optional[Dict[str, str]]:
     """
-    Get clipped streaming URL from Cobalt instances (no local file download).
-
-    Strategy:
-    1. Try multiple public Cobalt instances in sequence
-    2. Send sectionStart/sectionEnd so server performs clipping
-    3. Accept first successful response with status=stream and url
+    Plan A: clip locally with yt-dlp format 18 within 10s.
+    Plan B: return direct full video URL via yt-dlp -g.
     """
     start_seconds = max(0.0, float(start_time))
     duration = max(0.0, float(end_time) - float(start_time))
@@ -1478,13 +1474,6 @@ def create_viral_short(
         if status_placeholder:
             status_placeholder.error("❌ Invalid duration")
         return None
-
-    quality_level = 720
-    quality_text = str(quality or "")
-    if "1080" in quality_text:
-        quality_level = 1080
-    elif "480" in quality_text:
-        quality_level = 480
 
     video_id = extract_video_id(video_url) or "video"
     input_url = video_url if video_url.startswith("http") else f"https://www.youtube.com/watch?v={video_id}"
@@ -1501,15 +1490,15 @@ def create_viral_short(
 
     cleanup_old_tmp_files(max_age_seconds=3600)
 
-    def ytdlp_download_clipped(format_selector: str, attempt_tag: str) -> Optional[str]:
-        output_template = temp_path(f"fallback_clip_{video_id}_{attempt_tag}.%(ext)s")
+    def ytdlp_download_clipped() -> Optional[str]:
+        output_template = temp_path(f"fallback_clip_{video_id}_18.%(ext)s")
         cmd = [
             "yt-dlp",
             "--no-check-certificate",
             "--user-agent", DEFAULT_USER_AGENT,
             "--referer", "https://www.youtube.com/",
             "--limit-rate", "3M",
-            "-f", format_selector,
+            "-f", "18",
             "--download-sections", section_spec,
             "--force-keyframes-at-cuts",
             "-o", output_template,
@@ -1530,7 +1519,7 @@ def create_viral_short(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=240,
+                timeout=10,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if proc.returncode != 0:
@@ -1540,7 +1529,7 @@ def create_viral_short(
             return None
 
         candidates = sorted(
-            TEMP_DIR.glob(f"fallback_clip_{video_id}_{attempt_tag}*"),
+            TEMP_DIR.glob(f"fallback_clip_{video_id}_18*"),
             key=lambda p: p.stat().st_size if p.exists() else 0,
             reverse=True,
         )
@@ -1549,35 +1538,39 @@ def create_viral_short(
                 return str(item)
         return None
 
-    if status_placeholder:
-        status_placeholder.info("🚀 جاري تجهيز المقطع عبر خادم احتياطي سريع...")
+    local_clip = ytdlp_download_clipped()
+    if local_clip:
+        return {"mode": "clip", "value": local_clip}
 
-    format_attempts = []
-    if quality_level >= 1080:
-        format_attempts.append(("best[height<=1080][ext=mp4]/best", "1080"))
-    if quality_level >= 720:
-        format_attempts.append(("best[height<=720][ext=mp4]/best", "720"))
-    format_attempts.append(("best[height<=480][ext=mp4]/best", "480"))
-    # Rescue option requested by user: format 18 (360p mp4).
-    format_attempts.append(("18", "18"))
+    # Plan B: direct full video URL.
+    get_url_cmd = [
+        "yt-dlp",
+        "-g",
+        "--no-check-certificate",
+        "--user-agent", DEFAULT_USER_AGENT,
+        "--referer", "https://www.youtube.com/",
+        "-f", "18/best",
+        input_url,
+    ]
+    current_cookies_path = app_path("cookies.txt")
+    if os.path.exists(current_cookies_path):
+        get_url_cmd[1:1] = ["--cookies", current_cookies_path]
+    try:
+        proc = subprocess.run(
+            get_url_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if proc.returncode == 0:
+            urls = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip().startswith("http")]
+            if urls:
+                return {"mode": "direct", "value": urls[0]}
+    except Exception:
+        pass
 
-    seen = set()
-    unique_attempts = []
-    for selector, tag in format_attempts:
-        if selector in seen:
-            continue
-        seen.add(selector)
-        unique_attempts.append((selector, tag))
-
-    for selector, tag in unique_attempts:
-        local_clip = ytdlp_download_clipped(selector, tag)
-        if local_clip:
-            if status_placeholder:
-                status_placeholder.success(f"✅ تم تجهيز المقطع بنجاح (mode {tag})")
-            return local_clip
-
-    if progress_placeholder:
-        progress_placeholder.error("❌ تعذر تجهيز المقطع حالياً.")
     return None
 
 
@@ -1834,23 +1827,25 @@ def render_stage_3():
 
     st.markdown("### ✂️ تجهيز المقطع")
     if st.button("✂️ تجهيز فيديو اللقطة", use_container_width=True, type="primary", key="clip_now"):
-        status_placeholder = st.empty()
+        st.session_state.output_video = None
+        st.session_state.download_link = None
         with st.spinner("🚀 جاري تجهيز المقطع عبر خادم احتياطي سريع..."):
-            output_path = create_viral_short(
+            result = create_viral_short(
                 video_url=video_url,
                 start_time=float(selected.get("start_time", 0.0)),
                 end_time=float(selected.get("end_time", float(selected.get("start_time", 0.0)) + 45.0)),
                 quality=selected_quality,
                 progress_placeholder=None,
-                status_placeholder=status_placeholder,
+                status_placeholder=None,
             )
 
-        if output_path and os.path.exists(output_path):
-            st.session_state.output_video = output_path
+        if result and result.get("mode") == "clip" and os.path.exists(result.get("value", "")):
+            st.session_state.output_video = result["value"]
             st.success("✅ تم تجهيز الفيديو المقصوص بنجاح!")
+        elif result and result.get("mode") == "direct":
+            st.session_state.download_link = result["value"]
         else:
-            st.session_state.output_video = None
-            st.info("🚀 جاري تجهيز المقطع عبر خادم احتياطي سريع...")
+            st.error("❌ تعذر تجهيز المقطع حالياً.")
 
     output_video = st.session_state.get("output_video")
     if output_video and os.path.exists(output_video):
@@ -1871,6 +1866,22 @@ def render_stage_3():
             )
         except Exception as e:
             st.error(f"❌ تعذر تجهيز التحميل المحلي: {e}")
+
+    direct_link = st.session_state.get("download_link")
+    if direct_link:
+        st.warning("📥 تعذر القص آلياً، يمكنك تحميل الفيديو كاملاً عبر هذا الرابط المباشر")
+        st.link_button(
+            "📥 تحميل الفيديو الكامل",
+            url=direct_link,
+            use_container_width=True,
+        )
+
+    st.markdown("---")
+    st.link_button(
+        "🆘 فتح الفيديو يدوياً في Cobalt.tools",
+        url=f"https://cobalt.tools/?u={video_url}",
+        use_container_width=True,
+    )
 
 
 # ============= MAIN APP FLOW =============
