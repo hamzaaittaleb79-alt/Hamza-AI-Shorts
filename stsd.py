@@ -1720,18 +1720,23 @@ def read_essential_youtube_cookies() -> str:
     return "; ".join([f"{name}={cookie_map[name]}" for name in ordered_names if name in cookie_map])
 
 
-def cut_with_ytdlp_fallback_to_memory(
+def stream_clip_with_ytdlp_to_memory(
     video_url: str,
     start_time: float,
-    duration: float,
+    end_time: float,
 ) -> Tuple[bool, Optional[io.BytesIO], str]:
     """
-    Fallback: clip via yt-dlp and stream bytes from stdout.
+    Primary strategy: yt-dlp clips and streams MP4 to stdout, then BytesIO.
     """
-    section_spec = f"*{format_hhmmss(start_time)}-{format_hhmmss(start_time + duration)}"
+    start_value = max(0.0, float(start_time))
+    end_value = max(start_value + 1.0, float(end_time))
+    section_spec = f"*{format_hhmmss(start_value)}-{format_hhmmss(end_value)}"
     cmd = [
         "yt-dlp",
         "--no-check-certificate",
+        "--quiet",
+        "--no-warnings",
+        "--no-progress",
         "--user-agent", DEFAULT_USER_AGENT,
         "--download-sections", section_spec,
         "--force-keyframes-at-cuts",
@@ -1744,25 +1749,42 @@ def cut_with_ytdlp_fallback_to_memory(
         cmd[1:1] = ["--cookies", cookies_path]
 
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=240,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except Exception as exc:
-        return False, None, f"فشل fallback عبر yt-dlp: {exc}"
+        return False, None, f"فشل تشغيل yt-dlp: {exc}"
+
+    clip_buffer = io.BytesIO()
+    try:
+        if proc.stdout is None:
+            return False, None, "تعذر فتح stdout من yt-dlp."
+        while True:
+            chunk = proc.stdout.read(1024 * 256)
+            if not chunk:
+                break
+            clip_buffer.write(chunk)
+        _stdout_tail, stderr_data = proc.communicate(timeout=300)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _stdout_tail, stderr_data = proc.communicate()
+        ytdlp_tail = tail_text((stderr_data or b"").decode("utf-8", errors="ignore"), max_lines=20)
+        return False, None, f"انتهت مهلة yt-dlp أثناء القص: {ytdlp_tail or 'Timeout'}"
+    except Exception as exc:
+        proc.kill()
+        return False, None, f"تعذر قراءة تدفق yt-dlp: {exc}"
 
     if proc.returncode != 0:
-        ytdlp_tail = tail_text(proc.stderr.decode("utf-8", errors="ignore"), max_lines=20)
-        return False, None, f"فشل fallback عبر yt-dlp: {ytdlp_tail or 'Unknown error'}"
-    if not proc.stdout:
-        return False, None, "yt-dlp fallback لم يرجع بيانات MP4."
+        ytdlp_tail = tail_text((stderr_data or b"").decode("utf-8", errors="ignore"), max_lines=20)
+        return False, None, f"فشل yt-dlp أثناء قص المقطع: {ytdlp_tail or 'Unknown error'}"
+    if clip_buffer.tell() == 0:
+        return False, None, "yt-dlp لم يرجع بيانات MP4."
 
-    fallback_buffer = io.BytesIO(proc.stdout)
-    fallback_buffer.seek(0)
-    return True, fallback_buffer, ""
+    clip_buffer.seek(0)
+    return True, clip_buffer, ""
 
 
 def cut_direct_stream_to_memory(
@@ -1807,10 +1829,10 @@ def cut_direct_stream_to_memory(
     if proc.returncode != 0:
         ffmpeg_tail = tail_text(proc.stderr.decode("utf-8", errors="ignore"), max_lines=20)
         if source_video_url:
-            fallback_ok, fallback_buffer, fallback_error = cut_with_ytdlp_fallback_to_memory(
+            fallback_ok, fallback_buffer, fallback_error = stream_clip_with_ytdlp_to_memory(
                 video_url=source_video_url,
                 start_time=max(0.0, float(start_time)),
-                duration=float(duration),
+                end_time=max(0.0, float(start_time)) + float(duration),
             )
             if fallback_ok and fallback_buffer is not None:
                 fallback_buffer.seek(0)
@@ -2100,25 +2122,20 @@ def render_stage_3():
         st.session_state.stage3_clip_bytes = None
         st.session_state.stage3_clip_filename = None
 
-    st.markdown("### 📥 تحميل MP4 (yt-dlp + FFmpeg Pipe)")
+    st.markdown("### 📥 تحميل MP4 (yt-dlp Piping)")
     if st.button("⚡ جهّز القص المباشر للتحميل", use_container_width=True):
-        with st.spinner("جاري استخراج الرابط الخام وقص المقطع في الذاكرة..."):
-            ok_url, direct_or_error = get_direct_stream_url(video_url)
-            if not ok_url:
-                st.error(direct_or_error)
+        with st.spinner("جاري تحميل وقص المقطع عبر yt-dlp مباشرة إلى الذاكرة..."):
+            ok_clip, clip_buffer, clip_error = stream_clip_with_ytdlp_to_memory(
+                video_url=video_url,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            if not ok_clip or clip_buffer is None:
+                st.error(clip_error or "فشل تجهيز المقطع.")
             else:
-                ok_clip, clip_buffer, clip_error = cut_direct_stream_to_memory(
-                    direct_url=direct_or_error,
-                    start_time=start_time,
-                    duration=clip_duration,
-                    source_video_url=video_url,
-                )
-                if not ok_clip or clip_buffer is None:
-                    st.error(clip_error or "فشل تجهيز المقطع.")
-                else:
-                    st.session_state.stage3_clip_bytes = clip_buffer.getvalue()
-                    st.session_state.stage3_clip_filename = f"viral_clip_{video_id}_{start_seconds}_{end_seconds}.mp4"
-                    st.success("✅ المقطع جاهز. اضغط زر التحميل الآن.")
+                st.session_state.stage3_clip_bytes = clip_buffer.getvalue()
+                st.session_state.stage3_clip_filename = f"viral_clip_{video_id}_{start_seconds}_{end_seconds}.mp4"
+                st.success("✅ المقطع جاهز. اضغط زر التحميل الآن.")
 
     if st.session_state.stage3_clip_bytes:
         st.download_button(
