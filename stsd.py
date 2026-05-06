@@ -1245,6 +1245,36 @@ def create_html_download_trigger(download_url: str, filename: str = "video.mp4")
     return html_code
 
 
+def create_browser_cobalt_redirect_html(video_url: str, start_time: float, end_time: float) -> str:
+    """
+    Build a browser-side Cobalt launcher.
+    No server-side download: the user's browser opens cobalt.tools directly.
+    """
+    safe_video_url = (video_url or "").replace('"', '\\"').replace("'", "\\'")
+    start_seconds = max(0, int(float(start_time or 0)))
+    end_seconds = max(start_seconds + 1, int(float(end_time or (start_seconds + 45))))
+    cobalt_page_url = f"https://cobalt.tools/?u={safe_video_url}"
+    return f"""
+    <div style="text-align:center;padding:16px;border:1px solid rgba(255,215,0,0.3);border-radius:10px;background:#111;">
+      <button id="open-cobalt-btn" style="background:#ffd700;color:#0b0b0c;border:none;padding:12px 20px;border-radius:8px;font-weight:700;cursor:pointer;">
+        📥 تحميل عبر متصفحك (Cobalt)
+      </button>
+      <p style="color:#c7b89a;margin-top:10px;font-size:13px;">
+        سيُفتح Cobalt في تبويب جديد. ابدأ القص من {start_seconds}s إلى {end_seconds}s.
+      </p>
+    </div>
+    <script>
+      (function() {{
+        const btn = document.getElementById('open-cobalt-btn');
+        if (!btn) return;
+        btn.addEventListener('click', function() {{
+          window.open("{cobalt_page_url}", "_blank", "noopener,noreferrer");
+        }});
+      }})();
+    </script>
+    """
+
+
 def get_cobalt_direct_download_link(
     video_url: str,
     quality_level: int,
@@ -1816,8 +1846,8 @@ def render_stage_2():
 
 # ============= STAGE 3: DIRECT DOWNLOAD LINKS =============
 def render_stage_3():
-    """STAGE 3: Extract direct URL and let user download locally."""
-    st.markdown("### 🚀 المرحلة النهائية: قص وتحميل داخل التطبيق")
+    """STAGE 3: Browser-side download flow (no server-side download)."""
+    st.markdown("### 🚀 المرحلة النهائية: تحميل من المتصفح مباشرة")
 
     video_id = st.session_state.video_id
     video_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -1839,7 +1869,7 @@ def render_stage_3():
             st.rerun()
 
     st.markdown("---")
-    st.markdown("### 📥 اختر جودة القص")
+    st.markdown("### 📥 التحميل الذكي من المتصفح")
     quality_choice = st.radio(
         "اختر جودة الفيديو",
         ["720p (موصى به)", "1080p (HD)", "480p (سريع)"],
@@ -1853,48 +1883,20 @@ def render_stage_3():
     }
     selected_quality = quality_map[quality_choice]
 
-    st.markdown("### ✂️ تجهيز المقطع")
-    if st.button("✂️ تجهيز فيديو اللقطة", use_container_width=True, type="primary", key="clip_now"):
-        st.session_state.output_video = None
-        st.session_state.download_link = None
-        with st.spinner("🚀 جاري تجهيز المقطع عبر خادم احتياطي سريع..."):
-            result = create_viral_short(
-                video_url=video_url,
-                start_time=float(selected.get("start_time", 0.0)),
-                end_time=float(selected.get("end_time", float(selected.get("start_time", 0.0)) + 45.0)),
-                quality=selected_quality,
-                progress_placeholder=None,
-                status_placeholder=None,
-            )
+    start_time = float(selected.get("start_time", 0.0))
+    end_time = float(selected.get("end_time", start_time + 45.0))
+    start_seconds = max(0, int(start_time))
+    end_seconds = max(start_seconds + 1, int(end_time))
 
-        if result and result.get("mode") == "clip" and os.path.exists(result.get("value", "")):
-            st.session_state.output_video = result["value"]
-            st.success("✅ تم تجهيز الفيديو المقصوص بنجاح!")
-        else:
-            st.error("❌ تعذر تجهيز المقطع حالياً.")
+    st.info("⚡ بدون تحميل من السيرفر: التنفيذ يتم من متصفح المستخدم مباشرة.")
+    st.markdown("### 🎬 معاينة داخل الصفحة")
+    st.video(f"{video_url}&t={start_seconds}s")
 
-    output_video = st.session_state.get("output_video")
-    if output_video and os.path.exists(output_video):
-        st.markdown("---")
-        st.markdown("### 🎬 معاينة اللقطة مباشرة")
-        st.video(output_video)
-        st.markdown("### 📌 التحميل")
-        try:
-            with open(output_video, "rb") as file_handle:
-                video_bytes = file_handle.read()
-            clip_filename = f"viral_short_{video_id}_{selected.get('timestamp', '00-00').replace(':', '-')}_{selected_quality}.mp4"
-            st.download_button(
-                "📥 تحميل الفيديو المقصوص",
-                data=video_bytes,
-                file_name=clip_filename,
-                mime="video/mp4",
-                use_container_width=True,
-            )
-        except Exception as e:
-            st.error(f"❌ تعذر تجهيز التحميل المحلي: {e}")
+    st.markdown("### 📥 تنزيل عبر Cobalt من المتصفح")
+    cobalt_html = create_browser_cobalt_redirect_html(video_url, start_time, end_time)
+    st.components.v1.html(cobalt_html, height=170)
 
-    if not output_video:
-        st.info("جرّب لقطة أخرى أو أعد المحاولة بعد لحظات.")
+    st.caption(f"توقيت اللقطة المقترح: من {start_seconds}s إلى {end_seconds}s | الجودة المختارة: {selected_quality}")
 
 
 # ============= MAIN APP FLOW =============
