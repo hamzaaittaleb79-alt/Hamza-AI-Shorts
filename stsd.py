@@ -1471,7 +1471,7 @@ def create_viral_short(
     2. استخدام cookies.txt + User-Agent ثابت لتجاوز 403
     3. Return final output path ready for upload
     """
-    output_file = app_path("final_viral_clip.mp4")
+    output_file = temp_path("final_viral_clip.mp4")
     temp_clip_path = temp_path("temp_clip.mp4")
 
     start_seconds = max(0.0, float(start_time))
@@ -1499,21 +1499,25 @@ def create_viral_short(
         cleanup_temp_files(f"yt_direct_{video_id}")
         output_template = temp_path(f"yt_direct_{video_id}.%(ext)s")
         input_url = video_url if video_url.startswith("http") else f"https://www.youtube.com/watch?v={video_id}"
+        format_selector = "best[height<=720][ext=mp4]/best"
+        quality_text = str(quality or "")
+        if "1080" in quality_text:
+            format_selector = "best[height<=1080][ext=mp4]/best"
+        elif "480" in quality_text:
+            format_selector = "best[height<=480][ext=mp4]/best"
 
         cmd = [
             "yt-dlp",
+            "--cookies", cookies_path,
             "--no-check-certificate",
             "--user-agent", DEFAULT_USER_AGENT,
             "--referer", "https://www.youtube.com/",
-            "-f", "best[height<=720][ext=mp4]/best",
+            "-f", format_selector,
             "--download-sections", section_spec,
             "--force-keyframes-at-cuts",
             "-o", output_template,
             input_url,
         ]
-
-        if os.path.exists(cookies_path):
-            cmd[1:1] = ["--cookies", cookies_path]
 
         if status_placeholder:
             status_placeholder.info("⬇️ Downloading clipped segment مباشرة عبر yt-dlp + cookies.txt ...")
@@ -1805,23 +1809,16 @@ def render_stage_2():
 
 # ============= STAGE 3: DIRECT DOWNLOAD LINKS =============
 def render_stage_3():
-    """
-    STAGE 3 - ROCKET FAST MODEL: HTML/JS Auto-Download Triggers
-    
-    Ultra-fast approach: Fetch URL from Cobalt, immediately trigger browser download.
-    No server processing, no waiting, no temporary files.
-    User's browser handles everything with clean IP.
-    """
-    st.markdown("### 🚀 المرحلة النهائية: تحميل فوري")
-    
+    """STAGE 3: Server-side clipping with yt-dlp, preview, and direct download."""
+    st.markdown("### 🚀 المرحلة النهائية: قص وتحميل مباشر")
+
     video_id = st.session_state.video_id
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     selected = st.session_state.selected_moment
 
     st.markdown(f"**اللقطة المختارة:** {selected['title']} | {selected['timestamp']} | درجة الفيروسية: {int(selected['viral_score'])}/100")
     st.markdown("---")
-    
-    # Navigation buttons
+
     col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("← العودة للقائمة", use_container_width=True):
@@ -1830,130 +1827,64 @@ def render_stage_3():
     with col3:
         if st.button("🔄 فيديو جديد", use_container_width=True):
             st.session_state.stage = 1
-            for key in ["video_id", "url", "transcript", "viral_moments", "selected_moment", "download_link"]:
+            for key in ["video_id", "url", "transcript", "viral_moments", "selected_moment", "output_video", "download_link"]:
                 st.session_state[key] = None
             st.rerun()
-    
+
     st.markdown("---")
-    
-    # Quality selection
-    st.markdown("### 📥 اختر جودة التحميل")
+    st.markdown("### 📥 اختر جودة القص")
     quality_choice = st.radio(
         "اختر جودة الفيديو",
         ["720p (موصى به)", "1080p (HD)", "480p (سريع)"],
         index=0,
-        horizontal=True
+        horizontal=True,
     )
-    
     quality_map = {
-        "720p (موصى به)": 720,
-        "1080p (HD)": 1080,
-        "480p (سريع)": 480,
+        "720p (موصى به)": "720p",
+        "1080p (HD)": "1080p",
+        "480p (سريع)": "480p",
     }
     selected_quality = quality_map[quality_choice]
-    
-    # Initialize download link placeholder
-    if not hasattr(st.session_state, 'download_link') or not st.session_state.download_link:
-        st.session_state.download_link = None
-    
-    # MAIN ACTION: Rocket button - instant download trigger
-    st.markdown("### 🚀 اضغط الزر للتحميل الفوري:")
-    
-    if st.button("🚀 ابدأ التحميل الآن!", use_container_width=True, type="primary", key="rocket_download"):
-        # Spinner while fetching
-        with st.spinner("⏳ جاري الاتصال بالخادم السريع..."):
-            success, link_or_error = get_cobalt_direct_download_link(
+
+    st.markdown("### ✂️ ابدأ القص")
+    if st.button("✂️ قص اللحظة الآن", use_container_width=True, type="primary", key="clip_now"):
+        status_placeholder = st.empty()
+        with st.spinner("جاري قص اللحظة الذهبية..."):
+            output_path = create_viral_short(
                 video_url=video_url,
-                quality_level=selected_quality,
-                status_placeholder=None,
+                start_time=float(selected.get("start_time", 0.0)),
+                end_time=float(selected.get("end_time", float(selected.get("start_time", 0.0)) + 45.0)),
+                quality=selected_quality,
+                progress_placeholder=None,
+                status_placeholder=status_placeholder,
             )
-        
-        if success and link_or_error:
-            # Store link and rerun to trigger HTML component
-            st.session_state.download_link = link_or_error
-            st.session_state.download_triggered = True
-            st.rerun()
+
+        if output_path and os.path.exists(output_path):
+            st.session_state.output_video = output_path
+            st.success("✅ تم قص اللقطة بنجاح!")
         else:
-            st.error(f"❌ فشل الاتصال: {link_or_error}")
-            st.session_state.download_link = None
-    
-    # AUTO-DOWNLOAD TRIGGER: If link is available, trigger download immediately
-    if st.session_state.download_link and st.session_state.get("download_triggered", False):
+            st.session_state.output_video = None
+            st.error("❌ فشل قص اللقطة. تحقق من cookies.txt وحاول مرة أخرى.")
+
+    output_video = st.session_state.get("output_video")
+    if output_video and os.path.exists(output_video):
         st.markdown("---")
-        st.success("✅ لقد نجحنا! التحميل يبدأ الآن من جهازك 📥")
-        
-        # Generate filename
-        video_id_short = st.session_state.video_id[:8]
-        timestamp = selected['timestamp'].replace(':', '-')
-        filename = f"viral_short_{video_id_short}_{timestamp}_{selected_quality}p.mp4"
-        
-        # Trigger auto-download using HTML/JS
-        html_trigger = create_html_download_trigger(
-            download_url=st.session_state.download_link,
-            filename=filename
-        )
-        st.components.v1.html(html_trigger, height=120)
-        
-        st.markdown("---")
-        
-        # Display raw link for manual download
-        st.markdown("#### 🔗 رابط يدوي (إذا لم يبدأ التحميل):")
-        st.code(st.session_state.download_link, language="text")
-        
-        st.markdown("#### 📋 ماذا يحدث الآن:")
-        st.markdown("""
-        1. ✅ تم جلب الرابط من خادم Cobalt السريع
-        2. 📥 التحميل يبدأ الآن من متصفحك (IP نظيف)
-        3. ⏱️ لا توقف، لا انتظار - سرعة الإنترنت لديك فقط
-        
-        **السر:** التحميل يتم من جهازك، وليس من الخادم المحظور! 🎉
-        """)
-        
-        st.markdown("---")
-        
-        # Alternative options
-        st.markdown("#### 🔗 خيارات بديلة:")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.link_button(
-                "🌐 Cobalt الرسمي",
-                url="https://cobalt.tools/",
+        st.markdown("### 🎬 معاينة الفيديو")
+        st.video(output_video)
+
+        try:
+            with open(output_video, "rb") as file_handle:
+                video_bytes = file_handle.read()
+            clip_filename = f"viral_short_{video_id}_{selected.get('timestamp', '00-00').replace(':', '-')}_{selected_quality}.mp4"
+            st.download_button(
+                "⬇️ تحميل الفيديو مباشرة",
+                data=video_bytes,
+                file_name=clip_filename,
+                mime="video/mp4",
                 use_container_width=True,
-                help="خيارات تحميل متقدمة"
             )
-        
-        with col2:
-            st.link_button(
-                "⚡ SaveFrom",
-                url=f"https://en.savefrom.net/18/#url={video_url}",
-                use_container_width=True,
-                help="خدمة بديلة"
-            )
-        
-        st.markdown("---")
-        
-        # Next actions
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🎬 فيديو قصير جديد", use_container_width=True):
-                st.session_state.stage = 1
-                st.session_state.download_link = None
-                st.session_state.download_triggered = False
-                for key in ["video_id", "url", "transcript", "viral_moments", "selected_moment"]:
-                    st.session_state[key] = None
-                st.rerun()
-        
-        with col2:
-            if st.button("🎯 لقطات أخرى من نفس الفيديو", use_container_width=True):
-                st.session_state.stage = 2
-                st.session_state.download_link = None
-                st.session_state.download_triggered = False
-                st.rerun()
-    
-    else:
-        if not st.session_state.get("download_triggered", False):
-            st.info("👆 اضغط الزر أعلاه للحصول على رابط التحميل الفوري")
+        except Exception as e:
+            st.error(f"❌ تعذر تجهيز التحميل: {e}")
 
 
 # ============= MAIN APP FLOW =============
