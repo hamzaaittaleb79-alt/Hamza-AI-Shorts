@@ -29,7 +29,7 @@ except ImportError:
 
 
 # ============= CLOUD-SAFE PATH CONFIGURATION =============
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 APP_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 TEMP_DIR = Path(tempfile.gettempdir())
 
@@ -63,16 +63,17 @@ def build_yt_dlp_command(url: str, output_template: str, format_selector: str = 
         "yt-dlp",
         "-f", "best[height<=720][ext=mp4]", # جودة 720p لضمان السرعة وتجنب الحظر
         "--no-check-certificate",
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+        "--user-agent", DEFAULT_USER_AGENT,
         "-o", output_template,
         # استخدام العميل المكتبي العادي عبر الوسيط
         "--extractor-args", "youtube:player_client=web",
         "--force-ipv4",
     ]
     
-    # إضافة ملف الكوكيز إذا كان موجوداً (اختياري مع الوسيط)
-    if os.path.exists("cookies.txt"):
-        cmd.extend(["--cookies", "cookies.txt"])
+    # إضافة ملف الكوكيز من المسار المباشر داخل المجلد الرئيسي
+    cookies_path = app_path("cookies.txt")
+    if os.path.exists(cookies_path):
+        cmd.extend(["--cookies", cookies_path])
     
     if section_spec:
         cmd.extend(["--download-sections", section_spec, "--force-keyframes-at-cuts"])
@@ -98,13 +99,7 @@ def store_yt_dlp_error(stdout_text: str = "", stderr_text: str = "") -> str:
 
 # ============= USER-AGENT POOL & COBALT INSTANCE ROTATION =============
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
-    "Mozilla/5.0 (iPad; CPU OS 17_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+    DEFAULT_USER_AGENT,
 ]
 
 def get_random_user_agent() -> str:
@@ -283,11 +278,14 @@ def _fetch_transcript_with_ytdlp(video_id: str) -> Optional[List[Dict]]:
         "--sub-langs", "en.*,ar.*",
         "--no-check-certificate",
         "--prefer-insecure",
-        "--user-agent", get_random_user_agent(),
+        "--user-agent", DEFAULT_USER_AGENT,
         "--referer", "https://www.youtube.com/",
         "-o", output_template,
         video_url,
     ]
+    cookies_path = app_path("cookies.txt")
+    if os.path.exists(cookies_path):
+        cmd[1:1] = ["--cookies", cookies_path]
 
     expected_files = []
     for ext in ("vtt", "json", "json3", "srt"):
@@ -1325,11 +1323,11 @@ def create_viral_short(
     status_placeholder = None,
 ) -> Optional[str]:
     """
-    Production-grade short creation pipeline.
+    Production-grade short creation pipeline using direct yt-dlp download.
 
     Flow:
-    1. Request clipped segment from Cobalt API (cloud-safe)
-    2. Fallback to yt-dlp through a lightweight proxy if Cobalt fails
+    1. Download clipped segment مباشرة عبر yt-dlp
+    2. استخدام cookies.txt + User-Agent ثابت لتجاوز 403
     3. Return final output path ready for upload
     """
     output_file = app_path("final_viral_clip.mp4")
@@ -1346,6 +1344,7 @@ def create_viral_short(
     start_stamp = format_hhmmss(start_seconds)
     end_stamp = format_hhmmss(start_seconds + duration)
     section_spec = f"*{start_stamp}-{end_stamp}"
+    cookies_path = app_path("cookies.txt")
 
     def cleanup_temp_files(prefix: str) -> None:
         for file_path in TEMP_DIR.glob(f"{prefix}*"):
@@ -1354,34 +1353,29 @@ def create_viral_short(
             except Exception:
                 pass
 
-    def run_ytdlp_proxy_fallback() -> Tuple[bool, str]:
-        """Download the clipped segment via yt-dlp through a simple Invidious proxy source."""
-        cleanup_temp_files(f"yt_fallback_{video_id}")
-
-        proxy_instances = [
-            "https://yewtu.be",
-            "https://invidious.snopyta.org",
-            "https://vid.puffyan.us",
-            "https://inv.nadeko.net",
-        ]
-        proxy_source = f"{random.choice(proxy_instances)}/watch?v={video_id}"
-        output_template = temp_path(f"yt_fallback_{video_id}.%(ext)s")
+    def run_ytdlp_direct_download() -> Tuple[bool, str]:
+        """Download clipped segment مباشرة من YouTube باستخدام yt-dlp + cookies.txt."""
+        cleanup_temp_files(f"yt_direct_{video_id}")
+        output_template = temp_path(f"yt_direct_{video_id}.%(ext)s")
+        input_url = video_url if video_url.startswith("http") else f"https://www.youtube.com/watch?v={video_id}"
 
         cmd = [
             "yt-dlp",
             "--no-check-certificate",
-            "--prefer-insecure",
-            "--user-agent", get_random_user_agent(),
+            "--user-agent", DEFAULT_USER_AGENT,
             "--referer", "https://www.youtube.com/",
             "-f", "best[height<=720][ext=mp4]/best",
             "--download-sections", section_spec,
             "--force-keyframes-at-cuts",
             "-o", output_template,
-            proxy_source,
+            input_url,
         ]
 
+        if os.path.exists(cookies_path):
+            cmd[1:1] = ["--cookies", cookies_path]
+
         if status_placeholder:
-            status_placeholder.info("🛟 Cobalt failed; falling back to yt-dlp via proxy...")
+            status_placeholder.info("⬇️ Downloading clipped segment مباشرة عبر yt-dlp + cookies.txt ...")
 
         try:
             proc = subprocess.run(
@@ -1389,69 +1383,50 @@ def create_viral_short(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=120,
+                timeout=180,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except Exception as e:
-            return False, f"yt-dlp fallback failed: {e}"
+            return False, f"yt-dlp direct download failed: {e}"
 
         if proc.returncode != 0:
-            error_tail = tail_text("\n".join(part for part in [proc.stdout, proc.stderr] if part), max_lines=20)
-            return False, f"yt-dlp fallback HTTP/exec failure: {error_tail}"
+            error_tail = store_yt_dlp_error(proc.stdout, proc.stderr)
+            return False, f"yt-dlp direct download error: {error_tail}"
 
-        candidate_files = sorted(TEMP_DIR.glob(f"yt_fallback_{video_id}*"), key=lambda item: item.stat().st_size if item.exists() else 0, reverse=True)
+        candidate_files = sorted(
+            TEMP_DIR.glob(f"yt_direct_{video_id}*"),
+            key=lambda item: item.stat().st_size if item.exists() else 0,
+            reverse=True,
+        )
         if not candidate_files:
-            return False, "yt-dlp fallback produced no output file."
+            return False, "yt-dlp direct download produced no output file."
 
         for candidate in candidate_files:
             if candidate.is_file() and candidate.stat().st_size > 100000:
                 try:
                     shutil.copyfile(candidate, temp_clip_path)
-                    cleanup_temp_files(f"yt_fallback_{video_id}")
+                    cleanup_temp_files(f"yt_direct_{video_id}")
                     return True, ""
                 except Exception as e:
-                    return False, f"yt-dlp fallback save failed: {e}"
+                    return False, f"Failed saving direct clip: {e}"
 
-        cleanup_temp_files(f"yt_fallback_{video_id}")
-        return False, "yt-dlp fallback produced an empty/too-small clip."
+        cleanup_temp_files(f"yt_direct_{video_id}")
+        return False, "yt-dlp direct download produced an empty/too-small clip."
 
-    last_error = ""
     if os.path.exists(temp_clip_path):
         try:
             os.remove(temp_clip_path)
         except Exception:
             pass
 
-    for quality_level in [720, 480, 360]:
-        success, error_tail = download_with_cobalt(
-            video_url=video_url,
-            start_time=start_seconds,
-            end_time=start_seconds + duration,
-            temp_clip_path=temp_clip_path,
-            quality_level=quality_level,
-            status_placeholder=status_placeholder,
-        )
-        if success:
-            last_error = ""
-            break
-        last_error = error_tail
-        st.session_state.last_yt_dlp_error = last_error
-
-    if not os.path.exists(temp_clip_path) or os.path.getsize(temp_clip_path) == 0:
+    direct_success, direct_error = run_ytdlp_direct_download()
+    if not direct_success:
         if status_placeholder:
-            if last_error and ("403" in last_error or "400" in last_error):
-                status_placeholder.warning("⚠️ Cobalt failed. Trying yt-dlp proxy fallback...")
-            else:
-                status_placeholder.warning("⚠️ Cobalt API clipping failed. Trying yt-dlp proxy fallback...")
-
-        fallback_success, fallback_error = run_ytdlp_proxy_fallback()
-        if not fallback_success:
-            if status_placeholder:
-                status_placeholder.error("❌ Both Cobalt and yt-dlp fallback failed.")
-            st.session_state.last_yt_dlp_error = fallback_error or last_error
-            if st.session_state.last_yt_dlp_error:
-                st.code(st.session_state.last_yt_dlp_error, language="text")
-            return None
+            status_placeholder.error("❌ yt-dlp direct download failed.")
+        st.session_state.last_yt_dlp_error = direct_error
+        if st.session_state.last_yt_dlp_error:
+            st.code(st.session_state.last_yt_dlp_error, language="text")
+        return None
 
     if status_placeholder:
         status_placeholder.info("✅ Clipped segment downloaded")
