@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import subprocess
 import time
+import io
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Dict
 import streamlit as st
@@ -1632,6 +1633,93 @@ def create_viral_short(
     return None
 
 
+def get_direct_stream_url(video_url: str) -> Tuple[bool, str]:
+    """
+    Extract direct stream URL from YouTube via yt-dlp (-g).
+    """
+    cmd = [
+        "yt-dlp",
+        "--no-check-certificate",
+        "--user-agent", DEFAULT_USER_AGENT,
+        "-g",
+        video_url,
+    ]
+    cookies_path = app_path("cookies.txt")
+    if os.path.exists(cookies_path):
+        cmd[1:1] = ["--cookies", cookies_path]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=45,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        return False, f"تعذر تشغيل yt-dlp: {exc}"
+
+    if proc.returncode != 0:
+        store_yt_dlp_error(proc.stdout, proc.stderr)
+        error_tail = tail_text(f"{proc.stdout}\n{proc.stderr}", max_lines=15)
+        return False, f"فشل استخراج الرابط المباشر عبر yt-dlp: {error_tail or 'Unknown error'}"
+
+    # yt-dlp قد يرجع عدة روابط (فيديو/صوت)، نأخذ أول رابط صالح.
+    candidates = [line.strip() for line in proc.stdout.splitlines() if line.strip().startswith("http")]
+    if not candidates:
+        return False, "لم يرجع yt-dlp رابطًا مباشرًا صالحًا."
+    return True, candidates[0]
+
+
+def cut_direct_stream_to_memory(
+    direct_url: str,
+    start_time: float,
+    duration: float,
+) -> Tuple[bool, Optional[io.BytesIO], str]:
+    """
+    Clip direct stream URL in-memory using FFmpeg pipe output.
+    """
+    if duration <= 0:
+        return False, None, "مدة القص غير صالحة."
+
+    cmd = [
+        "ffmpeg",
+        "-ss", str(max(0.0, float(start_time))),
+        "-i", direct_url,
+        "-t", str(float(duration)),
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-movflags", "frag_keyframe+empty_moov",
+        "-f", "mp4",
+        "pipe:1",
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=180,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except FileNotFoundError:
+        return False, None, "ffmpeg غير مثبت أو غير موجود في PATH."
+    except Exception as exc:
+        return False, None, f"فشل تنفيذ FFmpeg: {exc}"
+
+    if proc.returncode != 0:
+        ffmpeg_tail = tail_text(proc.stderr.decode("utf-8", errors="ignore"), max_lines=20)
+        return False, None, f"فشل FFmpeg أثناء القص: {ffmpeg_tail or 'Unknown error'}"
+
+    if not proc.stdout:
+        return False, None, "FFmpeg انتهى دون إخراج بيانات MP4."
+
+    clip_buffer = io.BytesIO(proc.stdout)
+    clip_buffer.seek(0)
+    return True, clip_buffer, ""
+
+
 # ============= STAGE 1: INPUT & ANALYSIS =============
 def render_stage_1():
     """STAGE 1: Professional input form with video analysis."""
@@ -1844,10 +1932,10 @@ def render_stage_2():
                         st.rerun()
 
 
-# ============= STAGE 3: DIRECT DOWNLOAD LINKS =============
+# ============= STAGE 3: DIRECT PIPE DOWNLOAD =============
 def render_stage_3():
-    """STAGE 3: Browser-side download flow (no server-side download)."""
-    st.markdown("### 🚀 المرحلة النهائية: تحميل من المتصفح مباشرة")
+    """STAGE 3: Server-side instant clipping and direct download button."""
+    st.markdown("### 🚀 المرحلة النهائية: قص فوري + تحميل مباشر")
 
     video_id = st.session_state.video_id
     video_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -1885,18 +1973,56 @@ def render_stage_3():
 
     start_time = float(selected.get("start_time", 0.0))
     end_time = float(selected.get("end_time", start_time + 45.0))
+    clip_duration = max(1.0, end_time - start_time)
     start_seconds = max(0, int(start_time))
     end_seconds = max(start_seconds + 1, int(end_time))
 
-    st.info("⚡ بدون تحميل من السيرفر: التنفيذ يتم من متصفح المستخدم مباشرة.")
+    st.info("⚡ السيرفر سيقص المقطع المطلوب مباشرة من يوتيوب ويرسله فورًا كملف MP4.")
     st.markdown("### 🎬 معاينة داخل الصفحة")
     st.video(f"{video_url}&t={start_seconds}s")
 
-    st.markdown("### 📥 تنزيل عبر Cobalt من المتصفح")
-    cobalt_html = create_browser_cobalt_redirect_html(video_url, start_time, end_time)
-    st.components.v1.html(cobalt_html, height=170)
+    if "stage3_clip_bytes" not in st.session_state:
+        st.session_state.stage3_clip_bytes = None
+    if "stage3_clip_filename" not in st.session_state:
+        st.session_state.stage3_clip_filename = None
+    if "stage3_clip_key" not in st.session_state:
+        st.session_state.stage3_clip_key = None
 
-    st.caption(f"توقيت اللقطة المقترح: من {start_seconds}s إلى {end_seconds}s | الجودة المختارة: {selected_quality}")
+    clip_key = f"{video_id}:{start_seconds}:{end_seconds}:{selected_quality}"
+    if st.session_state.stage3_clip_key != clip_key:
+        st.session_state.stage3_clip_key = clip_key
+        st.session_state.stage3_clip_bytes = None
+        st.session_state.stage3_clip_filename = None
+
+    st.markdown("### 📥 تحميل MP4 (yt-dlp + FFmpeg Pipe)")
+    if st.button("⚡ جهّز القص المباشر للتحميل", use_container_width=True):
+        with st.spinner("جاري استخراج الرابط الخام وقص المقطع في الذاكرة..."):
+            ok_url, direct_or_error = get_direct_stream_url(video_url)
+            if not ok_url:
+                st.error(direct_or_error)
+            else:
+                ok_clip, clip_buffer, clip_error = cut_direct_stream_to_memory(
+                    direct_url=direct_or_error,
+                    start_time=start_time,
+                    duration=clip_duration,
+                )
+                if not ok_clip or clip_buffer is None:
+                    st.error(clip_error or "فشل تجهيز المقطع.")
+                else:
+                    st.session_state.stage3_clip_bytes = clip_buffer.getvalue()
+                    st.session_state.stage3_clip_filename = f"viral_clip_{video_id}_{start_seconds}_{end_seconds}.mp4"
+                    st.success("✅ المقطع جاهز. اضغط زر التحميل الآن.")
+
+    if st.session_state.stage3_clip_bytes:
+        st.download_button(
+            label="⬇️ تنزيل المقطع الآن",
+            data=io.BytesIO(st.session_state.stage3_clip_bytes),
+            file_name=st.session_state.stage3_clip_filename or "viral_clip.mp4",
+            mime="video/mp4",
+            use_container_width=True,
+        )
+
+    st.caption(f"توقيت اللقطة المقترح: من {start_seconds}s إلى {end_seconds}s | الجودة المختارة: {selected_quality} | مدة القص: {int(clip_duration)}s")
 
 
 # ============= MAIN APP FLOW =============
