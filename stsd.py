@@ -1429,6 +1429,7 @@ def get_cobalt_direct_download_link(
         "downloadMode": "auto",
         "filenameStyle": "nerdy",
         "isNoAudio": False,
+        "vCodec": "h264",
     }
     if start_time is not None:
         payload["sectionStart"] = round(max(0.0, float(start_time)), 3)
@@ -1500,6 +1501,120 @@ def get_cobalt_direct_download_link(
             return True, stream_url
     
     return False, "لم نتمكن من الاتصال بـ Cobalt. حاول مرة أخرى."
+
+
+def get_download_link_with_api_fallback(
+    video_url: str,
+    quality_level: int,
+    start_time: float,
+    end_time: float,
+) -> Tuple[bool, str, str]:
+    """
+    Try multiple external APIs and return a direct download URL + source.
+    """
+    ok_cobalt, cobalt_url_or_error = get_cobalt_direct_download_link(
+        video_url=video_url,
+        quality_level=quality_level,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    if ok_cobalt:
+        return True, cobalt_url_or_error, "cobalt"
+
+    payload = {
+        "url": video_url,
+        "videoQuality": quality_level,
+        "downloadMode": "auto",
+        "filenameStyle": "nerdy",
+        "isNoAudio": False,
+        "sectionStart": round(max(0.0, float(start_time)), 3),
+        "sectionEnd": round(max(0.0, float(end_time)), 3),
+        "vCodec": "h264",
+    }
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": get_random_user_agent(),
+    }
+
+    def extract_link(api_data: Any) -> Optional[str]:
+        if isinstance(api_data, dict):
+            for key in ("url", "download", "stream", "streamUrl", "link"):
+                value = api_data.get(key)
+                if isinstance(value, str) and value.startswith("http"):
+                    return value
+            for key in ("data", "result", "response"):
+                nested = api_data.get(key)
+                found = extract_link(nested)
+                if found:
+                    return found
+            for key in ("links", "files", "items"):
+                nested_items = api_data.get(key)
+                if isinstance(nested_items, list):
+                    for item in nested_items:
+                        found = extract_link(item)
+                        if found:
+                            return found
+        elif isinstance(api_data, list):
+            for item in api_data:
+                found = extract_link(item)
+                if found:
+                    return found
+        return None
+
+    # Fallback 1: api.pwn.sh
+    try:
+        pwn_response = requests.post(
+            "https://api.pwn.sh/api/json",
+            json=payload,
+            headers=headers,
+            timeout=20,
+        )
+        if pwn_response.status_code < 400:
+            pwn_data = pwn_response.json()
+            pwn_link = extract_link(pwn_data)
+            if pwn_link:
+                return True, pwn_link, "pwn.sh"
+    except Exception:
+        pass
+
+    # Fallback 2: invidious.io/api (best-effort direct stream from formatStreams)
+    try:
+        video_id = extract_video_id(video_url)
+        if video_id:
+            inv_response = requests.get(
+                f"https://invidious.io/api/v1/videos/{video_id}",
+                headers={"User-Agent": get_random_user_agent()},
+                timeout=20,
+            )
+            if inv_response.status_code < 400:
+                inv_data = inv_response.json()
+                streams = inv_data.get("formatStreams", []) if isinstance(inv_data, dict) else []
+                best_stream_url = None
+                best_height = 0
+                for item in streams:
+                    if not isinstance(item, dict):
+                        continue
+                    stream_url = item.get("url")
+                    stream_type = str(item.get("type", ""))
+                    if not isinstance(stream_url, str) or not stream_url.startswith("http"):
+                        continue
+                    if "video/mp4" not in stream_type:
+                        continue
+                    height_raw = str(item.get("resolution", "0")).split("x")[1] if "x" in str(item.get("resolution", "")) else "0"
+                    try:
+                        height = int(height_raw)
+                    except Exception:
+                        height = 0
+                    if height >= best_height:
+                        best_height = height
+                        best_stream_url = stream_url
+                if best_stream_url:
+                    return True, best_stream_url, "invidious"
+    except Exception:
+        pass
+
+    return False, cobalt_url_or_error, "none"
 
 
 def download_with_cobalt(
@@ -2455,10 +2570,10 @@ def render_stage_3():
     start_seconds = max(0, int(start_time))
     end_seconds = max(start_seconds + 1, int(end_time))
 
-    if "stage3_api_bytes" not in st.session_state:
-        st.session_state.stage3_api_bytes = None
-    if "stage3_api_filename" not in st.session_state:
-        st.session_state.stage3_api_filename = None
+    if "stage3_download_url" not in st.session_state:
+        st.session_state.stage3_download_url = ""
+    if "stage3_download_source" not in st.session_state:
+        st.session_state.stage3_download_source = ""
     if "stage3_api_key" not in st.session_state:
         st.session_state.stage3_api_key = ""
     if "stage3_api_error" not in st.session_state:
@@ -2470,18 +2585,19 @@ def render_stage_3():
     segment_key = f"{video_id}:{start_seconds}:{end_seconds}:{quality_level}"
     if st.session_state.stage3_api_key != segment_key:
         st.session_state.stage3_api_key = segment_key
-        st.session_state.stage3_api_bytes = None
-        st.session_state.stage3_api_filename = None
+        st.session_state.stage3_download_url = ""
+        st.session_state.stage3_download_source = ""
         st.session_state.stage3_api_error = ""
 
     st.markdown("### 🎬 معاينة داخل الصفحة")
     st.caption("شاهد اللقطة المختارة هنا، ثم اضغط زر التحميل اللحظي أدناه.")
     st.video(f"{video_url}&t={start_seconds}s")
 
-    st.markdown("### 📥 التحميل عبر API خارجي")
-    if st.button("⚡ تجهيز المقطع عبر Cobalt API", use_container_width=True):
-        with st.spinner("إرسال الطلب إلى Cobalt API ثم سحب الملف في السيرفر..."):
-            ok_link, link_or_error = get_cobalt_direct_download_link(
+    st.markdown("### 📥 التحميل السريع عبر API خارجي")
+    st.info("📥 جاري تجهيز رابط التحميل السريع...")
+    if st.button("⚡ تجهيز رابط التحميل الآن", use_container_width=True):
+        with st.spinner("تجهيز الرابط عبر Cobalt ثم fallback تلقائي..."):
+            ok_link, link_or_error, source_name = get_download_link_with_api_fallback(
                 video_url=video_url,
                 quality_level=quality_level,
                 start_time=start_seconds,
@@ -2489,33 +2605,25 @@ def render_stage_3():
             )
             if not ok_link:
                 st.session_state.stage3_api_error = link_or_error or "فشل الحصول على رابط من Cobalt API."
-                st.session_state.stage3_api_bytes = None
+                st.session_state.stage3_download_url = ""
+                st.session_state.stage3_download_source = ""
             else:
-                try:
-                    with requests.get(link_or_error, stream=True, timeout=300) as response:
-                        response.raise_for_status()
-                        clip_bytes = b"".join(chunk for chunk in response.iter_content(chunk_size=256 * 1024) if chunk)
-                    if not clip_bytes:
-                        raise ValueError("Cobalt returned empty content")
-                    st.session_state.stage3_api_bytes = clip_bytes
-                    st.session_state.stage3_api_filename = f"viral_cobalt_{video_id}_{start_seconds}_{end_seconds}.mp4"
-                    st.session_state.stage3_api_error = ""
-                    st.success("✅ المقطع جاهز للتحميل داخل الصفحة.")
-                except Exception as exc:
-                    st.session_state.stage3_api_error = f"فشل تنزيل الملف من رابط Cobalt: {exc}"
-                    st.session_state.stage3_api_bytes = None
+                st.session_state.stage3_download_url = link_or_error
+                st.session_state.stage3_download_source = source_name
+                st.session_state.stage3_api_error = ""
+                st.success("✅ الرابط السريع جاهز. اضغط الزر الأخضر للبدء.")
 
     if st.session_state.stage3_api_error:
         st.error(st.session_state.stage3_api_error)
 
-    if st.session_state.stage3_api_bytes:
-        st.download_button(
-            label="⬇️ تنزيل المقطع الآن",
-            data=io.BytesIO(st.session_state.stage3_api_bytes),
-            file_name=st.session_state.stage3_api_filename or f"viral_cobalt_{video_id}.mp4",
-            mime="video/mp4",
+    if st.session_state.stage3_download_url:
+        if st.session_state.stage3_download_source:
+            st.caption(f"المصدر المستخدم: {st.session_state.stage3_download_source}")
+        st.link_button(
+            "✅ اضغط هنا لبدء التحميل الآن",
+            st.session_state.stage3_download_url,
             use_container_width=True,
-            key="stage3_api_dl",
+            type="primary",
         )
 
     st.caption(
