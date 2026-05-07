@@ -11,7 +11,7 @@ import io
 import secrets
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode, urlunparse
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Dict
 import streamlit as st
@@ -1874,6 +1874,55 @@ def load_requests_cookies_from_file() -> Dict[str, str]:
     return cookie_dict
 
 
+def add_start_end_to_stream_url(stream_url: str, start_time: float, end_time: float) -> str:
+    """
+    Append start/end query params to a direct stream URL.
+    """
+    parsed = urlparse(stream_url)
+    query_items = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query_items["start"] = str(max(0, int(float(start_time))))
+    query_items["end"] = str(max(int(float(start_time)) + 1, int(float(end_time))))
+    return urlunparse(parsed._replace(query=urlencode(query_items)))
+
+
+def stream_youtube_chunks_to_memory(
+    stream_url: str,
+    user_agent: str,
+    cookies: Dict[str, str],
+) -> Tuple[bool, Optional[io.BytesIO], str]:
+    """
+    Stream response chunks from YouTube into BytesIO using identity transfer.
+    """
+    headers = {
+        "User-Agent": user_agent,
+        "Referer": "https://www.youtube.com/",
+        "Accept-Encoding": "identity",
+    }
+    clip_buffer = io.BytesIO()
+    try:
+        with requests.get(
+            stream_url,
+            stream=True,
+            headers=headers,
+            cookies=cookies,
+            timeout=300,
+            verify=False,
+        ) as response:
+            response.raise_for_status()
+            for chunk in response.iter_content(chunk_size=256 * 1024):
+                if chunk:
+                    clip_buffer.write(chunk)
+    except requests.RequestException as exc:
+        return False, None, f"فشل السحب اللحظي من يوتيوب: {exc}"
+    except Exception as exc:
+        return False, None, f"فشل أثناء ضخ البيانات: {exc}"
+
+    if clip_buffer.tell() == 0:
+        return False, None, "لم تصل أي بيانات من المصدر."
+    clip_buffer.seek(0)
+    return True, clip_buffer, ""
+
+
 def stream_clip_with_ytdlp_to_memory(
     video_url: str,
     start_time: float,
@@ -2331,8 +2380,8 @@ def build_client_side_clipper_html(
 
 # ============= STAGE 3: CLIENT-SIDE CLIP (BYPASS BLOCKED SERVER IP) =============
 def render_stage_3():
-    """STAGE 3: yt-dlp direct URL + browser fetch/Blob; optional local stream proxy + server fallback."""
-    st.markdown("### 🚀 المرحلة النهائية: قص في جهاز الزبون (تجاوز حظر IP السيرفر)")
+    """STAGE 3: emergency response streaming via direct URL + requests chunks."""
+    st.markdown("### 🚀 المرحلة النهائية: التمرير اللحظي (Emergency Streaming)")
 
     video_id = st.session_state.video_id
     video_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -2355,9 +2404,8 @@ def render_stage_3():
 
     st.markdown("---")
     st.warning(
-        "**HTML5 + Blob:** السيرفر يجلب **رابط البث المباشر** فقط عبر `yt-dlp`، ثم المتصفح ينفّذ `fetch` من جهاز الزبون. "
-        "إذا منع **CORS**، يُفعّل **بروكسي تدفق محلي** على `127.0.0.1` (يعمل عند تشغيل Streamlit على جهازك؛ على السحابة عطّله عبر `VIRAFLOW_DISABLE_STREAM_PROXY=1`). "
-        "يمكن ضبط `YTDLP_PROXY` لمساعدة yt-dlp على السيرفر."
+        "وضع الطوارئ مفعّل: سيتم جلب رابط مباشر عبر yt-dlp ثم سحب الفيديو بتمرير لحظي "
+        "(`requests.get(stream=True)`) بنفس الهوية (`User-Agent` + `Cookies`) مع `Accept-Encoding: identity`."
     )
 
     start_time = float(selected.get("start_time", 0.0))
@@ -2366,123 +2414,65 @@ def render_stage_3():
     start_seconds = max(0, int(start_time))
     end_seconds = max(start_seconds + 1, int(end_time))
 
-    if "stage3_server_direct" not in st.session_state:
-        st.session_state.stage3_server_direct = ""
-    if "stage3_segment_key" not in st.session_state:
-        st.session_state.stage3_segment_key = ""
-    if "stage3_ytdlp_err" not in st.session_state:
-        st.session_state.stage3_ytdlp_err = ""
-    if "stage3_server_blob" not in st.session_state:
-        st.session_state.stage3_server_blob = None
+    if "stage3_stream_bytes" not in st.session_state:
+        st.session_state.stage3_stream_bytes = None
+    if "stage3_stream_filename" not in st.session_state:
+        st.session_state.stage3_stream_filename = None
+    if "stage3_stream_key" not in st.session_state:
+        st.session_state.stage3_stream_key = ""
+    if "stage3_stream_error" not in st.session_state:
+        st.session_state.stage3_stream_error = ""
 
-    segment_key = f"{video_id}:{start_seconds}:{end_seconds}"
-    if st.session_state.stage3_segment_key != segment_key:
-        st.session_state.stage3_segment_key = segment_key
-        st.session_state.stage3_server_blob = None
-        st.session_state.stage3_ytdlp_err = ""
-        with st.spinner("yt-dlp: جلب الرابط المباشر في الخلفية…"):
-            ok_u, u_or_err = get_direct_stream_url(video_url)
-            if ok_u:
-                st.session_state.stage3_server_direct = u_or_err
-            else:
-                st.session_state.stage3_server_direct = ""
-                st.session_state.stage3_ytdlp_err = u_or_err or ""
-
-    proxy_active = get_ytdlp_proxy()
-    if proxy_active:
-        st.caption("بروكسي yt-dlp على السيرفر مفعّل (`YTDLP_PROXY`).")
-    else:
-        st.caption("لا يوجد بروكسي لـ yt-dlp على السيرفر — قد يفشل جلب الرابط إن كان IP الحاوية محظوراً.")
-
-    if st.session_state.stage3_ytdlp_err and not st.session_state.stage3_server_direct:
-        st.error(st.session_state.stage3_ytdlp_err)
-
-    if stream_proxy_enabled():
-        st.caption("بروكسي التدفق المحلي (للمتصفح): **مفعّل** — يستخدمه الإطار عند فشل fetch المباشر.")
-    else:
-        st.caption("بروكسي التدفق المحلي: **معطّل** — يعتمد المتصفح على fetch المباشر فقط.")
+    segment_key = f"{video_id}:{start_seconds}:{end_seconds}:{selected_quality}"
+    if st.session_state.stage3_stream_key != segment_key:
+        st.session_state.stage3_stream_key = segment_key
+        st.session_state.stage3_stream_bytes = None
+        st.session_state.stage3_stream_filename = None
+        st.session_state.stage3_stream_error = ""
 
     st.markdown("### 🎬 معاينة داخل الصفحة")
-    st.caption("شاهد اللقطة المختارة هنا؛ التحميل النهائي عبر الزر الأصفر في الإطار أدناه (Blob).")
+    st.caption("شاهد اللقطة المختارة هنا، ثم اضغط زر التحميل اللحظي أدناه.")
     st.video(f"{video_url}&t={start_seconds}s")
 
-    st.markdown("### 📥 جلب الرابط (yt-dlp على السيرفر)")
-    col_srv, col_clr = st.columns(2)
-    with col_srv:
-        if st.button("تحديث الرابط (yt-dlp)", use_container_width=True):
-            with st.spinner("yt-dlp…"):
-                ok_u, u_or_err = get_direct_stream_url(video_url)
-                if ok_u:
-                    st.session_state.stage3_server_direct = u_or_err
-                    st.session_state.stage3_ytdlp_err = ""
-                    st.session_state.stage3_server_blob = None
-                    st.success("تم تحديث الرابط.")
+    st.markdown("### 📥 التحميل اللحظي من المصدر")
+    if st.button("⚡ بدء التمرير اللحظي للتنزيل", use_container_width=True):
+        with st.spinner("yt-dlp يجلب الرابط ثم requests يضخ البيانات chunk-by-chunk..."):
+            ok_u, u_or_err = get_direct_stream_url(video_url)
+            if not ok_u:
+                st.session_state.stage3_stream_error = u_or_err or "تعذر جلب الرابط المباشر."
+                st.session_state.stage3_stream_bytes = None
+            else:
+                direct_with_range = add_start_end_to_stream_url(u_or_err, start_seconds, end_seconds)
+                ok_stream, stream_buffer, stream_err = stream_youtube_chunks_to_memory(
+                    stream_url=direct_with_range,
+                    user_agent=DEFAULT_USER_AGENT,
+                    cookies=load_requests_cookies_from_file(),
+                )
+                if not ok_stream or stream_buffer is None:
+                    st.session_state.stage3_stream_error = stream_err or "فشل التمرير اللحظي."
+                    st.session_state.stage3_stream_bytes = None
                 else:
-                    st.session_state.stage3_server_direct = ""
-                    st.session_state.stage3_ytdlp_err = u_or_err or ""
-                    st.error(u_or_err)
-    with col_clr:
-        if st.button("مسح الرابط المخزّن", use_container_width=True):
-            st.session_state.stage3_server_direct = ""
-            st.session_state.stage3_server_blob = None
+                    st.session_state.stage3_stream_error = ""
+                    st.session_state.stage3_stream_bytes = stream_buffer.getvalue()
+                    st.session_state.stage3_stream_filename = f"viral_stream_{video_id}_{start_seconds}_{end_seconds}.mp4"
+                    st.success("✅ تم ضخ البيانات بنجاح. زر التحميل جاهز.")
 
-    direct = (st.session_state.stage3_server_direct or "").strip()
-    proxy_stream: Optional[str] = None
-    if direct:
-        proxy_stream = register_stream_proxy_url(
-            direct,
-            headers={
-                "User-Agent": DEFAULT_USER_AGENT,
-                "Referer": "https://www.youtube.com/",
-            },
-            cookies=load_requests_cookies_from_file(),
-        )
+    if st.session_state.stage3_stream_error:
+        st.error(st.session_state.stage3_stream_error)
 
-    dl_name = f"viraflow_{video_id}_{start_seconds}_{end_seconds}.mp4"
-    clip_html = build_client_side_clipper_html(
-        direct_url=direct,
-        proxy_url=proxy_stream,
-        download_filename=dl_name,
-    )
-    st.components.v1.html(clip_html, height=420, scrolling=True)
-
-    st.markdown("### بديل: تنزيل كامل عبر السيرفر")
-    st.caption(
-        "إذا فشل المتصفح، يمكن تحميل الملف عبر السيرفر (يستهلك ذاكرة وقد يُحظر 403). "
-        "لا يوجد قص دقيق هنا — الملف كما يعيده الرابط المباشر."
-    )
-    if direct:
-        if st.button("تجهيز الملف على السيرفر للتنزيل", use_container_width=True, key="stage3_server_fetch"):
-            headers_dl = {
-                "User-Agent": DEFAULT_USER_AGENT,
-                "Referer": "https://www.youtube.com/",
-            }
-            cookies_dl = load_requests_cookies_from_file()
-            try:
-                with st.spinner("تنزيل من الرابط المباشر على السيرفر…"):
-                    with requests.get(direct, stream=True, headers=headers_dl, cookies=cookies_dl, timeout=300) as r:
-                        r.raise_for_status()
-                        st.session_state.stage3_server_blob = b"".join(
-                            chunk for chunk in r.iter_content(chunk_size=256 * 1024) if chunk
-                        )
-                st.success("جاهز للتنزيل.")
-            except Exception as exc:
-                st.session_state.stage3_server_blob = None
-                st.error(f"فشل التنزيل على السيرفر: {exc}")
-
-    if st.session_state.stage3_server_blob:
+    if st.session_state.stage3_stream_bytes:
         st.download_button(
-            label="⬇️ تنزيل الملف (من السيرفر)",
-            data=st.session_state.stage3_server_blob,
-            file_name=dl_name,
+            label="⬇️ تنزيل المقطع الآن",
+            data=io.BytesIO(st.session_state.stage3_stream_bytes),
+            file_name=st.session_state.stage3_stream_filename or f"viral_stream_{video_id}.mp4",
             mime="video/mp4",
             use_container_width=True,
-            key="stage3_dl_server",
+            key="stage3_stream_dl",
         )
 
     st.caption(
-        f"توقيت اللقطة: من {start_seconds}s إلى {end_seconds}s | مدة القص (للمرجع): {int(clip_duration)}s — "
-        "تنزيل Blob يجلب عادة **الكامل** من الرابط المباشر (بدون قص في المتصفح)."
+        f"توقيت اللقطة: من {start_seconds}s إلى {end_seconds}s | الجودة المختارة: {selected_quality} | "
+        "يتم السحب عبر stream + identity transfer دون ضغط."
     )
 
 
