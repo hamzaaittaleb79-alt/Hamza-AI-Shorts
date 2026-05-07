@@ -2383,9 +2383,10 @@ def render_stage_3():
     """STAGE 3: emergency response streaming via direct URL + requests chunks."""
     st.markdown("### 🚀 المرحلة النهائية: التمرير اللحظي (Emergency Streaming)")
 
-    video_id = st.session_state.video_id
+    video_id = st.session_state.get("video_id")
+    selected_quality = st.session_state.get("quality", "720p")
     video_url = f"https://www.youtube.com/watch?v={video_id}"
-    selected = st.session_state.selected_moment
+    selected = st.session_state.get("selected_moment") or {}
 
     st.markdown(f"**اللقطة المختارة:** {selected['title']} | {selected['timestamp']} | درجة الفيروسية: {int(selected['viral_score'])}/100")
     st.markdown("---")
@@ -2408,8 +2409,8 @@ def render_stage_3():
         "(`requests.get(stream=True)`) بنفس الهوية (`User-Agent` + `Cookies`) مع `Accept-Encoding: identity`."
     )
 
-    start_time = float(selected.get("start_time", 0.0))
-    end_time = float(selected.get("end_time", start_time + 45.0))
+    start_time = float(st.session_state.get("selected_moment", {}).get("start_time", 0.0))
+    end_time = float(st.session_state.get("selected_moment", {}).get("end_time", start_time + 45.0))
     clip_duration = max(1.0, end_time - start_time)
     start_seconds = max(0, int(start_time))
     end_seconds = max(start_seconds + 1, int(end_time))
