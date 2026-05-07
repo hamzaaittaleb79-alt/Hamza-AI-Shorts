@@ -32,9 +32,19 @@ try:
 except ImportError:
     pass
 
+try:
+    import cloudscraper
+    HAS_CLOUDSCRAPER = True
+except ImportError:
+    HAS_CLOUDSCRAPER = False
+    cloudscraper = None
+
 
 # ============= CLOUD-SAFE PATH CONFIGURATION =============
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+ANDROID_YT_USER_AGENT = "com.google.android.youtube/19.11.38 (Linux; U; Android 11; en_US; Pixel 5; Build/RQ2A.210305.006)"
+ANDROID_YT_CLIENT_NAME = "3"
+ANDROID_YT_CLIENT_VERSION = "19.11.38"
 APP_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 TEMP_DIR = Path(tempfile.gettempdir())
 
@@ -1765,7 +1775,10 @@ def get_direct_stream_url(video_url: str) -> Tuple[bool, str]:
     cmd = [
         "yt-dlp",
         "--no-check-certificate",
-        "--user-agent", DEFAULT_USER_AGENT,
+        "--user-agent", ANDROID_YT_USER_AGENT,
+        "--extractor-args", "youtube:player_client=android",
+        "--add-header", f"X-YouTube-Client-Name:{ANDROID_YT_CLIENT_NAME}",
+        "--add-header", f"X-YouTube-Client-Version:{ANDROID_YT_CLIENT_VERSION}",
         "-g",
         video_url,
     ]
@@ -1895,10 +1908,19 @@ def stream_youtube_chunks_to_memory(
     """
     headers = {
         "User-Agent": user_agent,
+        "X-YouTube-Client-Name": ANDROID_YT_CLIENT_NAME,
+        "X-YouTube-Client-Version": ANDROID_YT_CLIENT_VERSION,
+        "Origin": "https://www.youtube.com",
         "Referer": "https://www.youtube.com/",
         "Accept-Encoding": "identity",
     }
     clip_buffer = io.BytesIO()
+
+    def write_response_chunks(response_obj) -> None:
+        for chunk in response_obj.iter_content(chunk_size=256 * 1024):
+            if chunk:
+                clip_buffer.write(chunk)
+
     try:
         with requests.get(
             stream_url,
@@ -1909,11 +1931,26 @@ def stream_youtube_chunks_to_memory(
             verify=False,
         ) as response:
             response.raise_for_status()
-            for chunk in response.iter_content(chunk_size=256 * 1024):
-                if chunk:
-                    clip_buffer.write(chunk)
+            write_response_chunks(response)
     except requests.RequestException as exc:
-        return False, None, f"فشل السحب اللحظي من يوتيوب: {exc}"
+        # Emergency fallback for anti-bot/front-door protections.
+        if HAS_CLOUDSCRAPER:
+            try:
+                scraper = cloudscraper.create_scraper(browser={"custom": user_agent})
+                with scraper.get(
+                    stream_url,
+                    stream=True,
+                    headers=headers,
+                    cookies=cookies,
+                    timeout=300,
+                    verify=False,
+                ) as response:
+                    response.raise_for_status()
+                    write_response_chunks(response)
+            except Exception as cloud_exc:
+                return False, None, f"فشل requests ثم cloudscraper: {cloud_exc}"
+        else:
+            return False, None, f"فشل السحب اللحظي من يوتيوب: {exc}"
     except Exception as exc:
         return False, None, f"فشل أثناء ضخ البيانات: {exc}"
 
@@ -2446,7 +2483,7 @@ def render_stage_3():
                 direct_with_range = add_start_end_to_stream_url(u_or_err, start_seconds, end_seconds)
                 ok_stream, stream_buffer, stream_err = stream_youtube_chunks_to_memory(
                     stream_url=direct_with_range,
-                    user_agent=DEFAULT_USER_AGENT,
+                    user_agent=ANDROID_YT_USER_AGENT,
                     cookies=load_requests_cookies_from_file(),
                 )
                 if not ok_stream or stream_buffer is None:
