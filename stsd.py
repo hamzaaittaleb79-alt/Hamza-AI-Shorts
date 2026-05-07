@@ -1414,6 +1414,8 @@ def create_browser_cobalt_redirect_html(video_url: str, start_time: float, end_t
 def get_cobalt_direct_download_link(
     video_url: str,
     quality_level: int,
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
     status_placeholder = None,
 ) -> Tuple[bool, str]:
     """
@@ -1428,6 +1430,10 @@ def get_cobalt_direct_download_link(
         "filenameStyle": "nerdy",
         "isNoAudio": False,
     }
+    if start_time is not None:
+        payload["sectionStart"] = round(max(0.0, float(start_time)), 3)
+    if end_time is not None:
+        payload["sectionEnd"] = round(max(0.0, float(end_time)), 3)
 
     # Try multiple Cobalt instances with random User-Agents
     instances = get_cobalt_instances_list()
@@ -2417,8 +2423,8 @@ def build_client_side_clipper_html(
 
 # ============= STAGE 3: CLIENT-SIDE CLIP (BYPASS BLOCKED SERVER IP) =============
 def render_stage_3():
-    """STAGE 3: emergency response streaming via direct URL + requests chunks."""
-    st.markdown("### 🚀 المرحلة النهائية: التمرير اللحظي (Emergency Streaming)")
+    """STAGE 3: Cobalt API relay to in-page download."""
+    st.markdown("### 🚀 المرحلة النهائية: تحميل داخل الصفحة عبر Cobalt API")
 
     video_id = st.session_state.get("video_id")
     selected_quality = st.session_state.get("quality", "720p")
@@ -2441,10 +2447,7 @@ def render_stage_3():
             st.rerun()
 
     st.markdown("---")
-    st.warning(
-        "وضع الطوارئ مفعّل: سيتم جلب رابط مباشر عبر yt-dlp ثم سحب الفيديو بتمرير لحظي "
-        "(`requests.get(stream=True)`) بنفس الهوية (`User-Agent` + `Cookies`) مع `Accept-Encoding: identity`."
-    )
+    st.warning("السيرفر محظور من يوتيوب (403)، لذلك نستخدم Cobalt API لإرجاع رابط نظيف ثم نسحبه داخل صفحتنا.")
 
     start_time = float(st.session_state.get("selected_moment", {}).get("start_time", 0.0))
     end_time = float(st.session_state.get("selected_moment", {}).get("end_time", start_time + 45.0))
@@ -2452,65 +2455,72 @@ def render_stage_3():
     start_seconds = max(0, int(start_time))
     end_seconds = max(start_seconds + 1, int(end_time))
 
-    if "stage3_stream_bytes" not in st.session_state:
-        st.session_state.stage3_stream_bytes = None
-    if "stage3_stream_filename" not in st.session_state:
-        st.session_state.stage3_stream_filename = None
-    if "stage3_stream_key" not in st.session_state:
-        st.session_state.stage3_stream_key = ""
-    if "stage3_stream_error" not in st.session_state:
-        st.session_state.stage3_stream_error = ""
+    if "stage3_api_bytes" not in st.session_state:
+        st.session_state.stage3_api_bytes = None
+    if "stage3_api_filename" not in st.session_state:
+        st.session_state.stage3_api_filename = None
+    if "stage3_api_key" not in st.session_state:
+        st.session_state.stage3_api_key = ""
+    if "stage3_api_error" not in st.session_state:
+        st.session_state.stage3_api_error = ""
 
-    segment_key = f"{video_id}:{start_seconds}:{end_seconds}:{selected_quality}"
-    if st.session_state.stage3_stream_key != segment_key:
-        st.session_state.stage3_stream_key = segment_key
-        st.session_state.stage3_stream_bytes = None
-        st.session_state.stage3_stream_filename = None
-        st.session_state.stage3_stream_error = ""
+    quality_to_level = {"720p": 720, "1080p (HD)": 1080, "1080p": 1080, "480p (سريع)": 480, "480p": 480}
+    quality_level = quality_to_level.get(str(selected_quality), 720)
+
+    segment_key = f"{video_id}:{start_seconds}:{end_seconds}:{quality_level}"
+    if st.session_state.stage3_api_key != segment_key:
+        st.session_state.stage3_api_key = segment_key
+        st.session_state.stage3_api_bytes = None
+        st.session_state.stage3_api_filename = None
+        st.session_state.stage3_api_error = ""
 
     st.markdown("### 🎬 معاينة داخل الصفحة")
     st.caption("شاهد اللقطة المختارة هنا، ثم اضغط زر التحميل اللحظي أدناه.")
     st.video(f"{video_url}&t={start_seconds}s")
 
-    st.markdown("### 📥 التحميل اللحظي من المصدر")
-    if st.button("⚡ بدء التمرير اللحظي للتنزيل", use_container_width=True):
-        with st.spinner("yt-dlp يجلب الرابط ثم requests يضخ البيانات chunk-by-chunk..."):
-            ok_u, u_or_err = get_direct_stream_url(video_url)
-            if not ok_u:
-                st.session_state.stage3_stream_error = u_or_err or "تعذر جلب الرابط المباشر."
-                st.session_state.stage3_stream_bytes = None
+    st.markdown("### 📥 التحميل عبر API خارجي")
+    if st.button("⚡ تجهيز المقطع عبر Cobalt API", use_container_width=True):
+        with st.spinner("إرسال الطلب إلى Cobalt API ثم سحب الملف في السيرفر..."):
+            ok_link, link_or_error = get_cobalt_direct_download_link(
+                video_url=video_url,
+                quality_level=quality_level,
+                start_time=start_seconds,
+                end_time=end_seconds,
+            )
+            if not ok_link:
+                st.session_state.stage3_api_error = link_or_error or "فشل الحصول على رابط من Cobalt API."
+                st.session_state.stage3_api_bytes = None
             else:
-                direct_with_range = add_start_end_to_stream_url(u_or_err, start_seconds, end_seconds)
-                ok_stream, stream_buffer, stream_err = stream_youtube_chunks_to_memory(
-                    stream_url=direct_with_range,
-                    user_agent=ANDROID_YT_USER_AGENT,
-                    cookies=load_requests_cookies_from_file(),
-                )
-                if not ok_stream or stream_buffer is None:
-                    st.session_state.stage3_stream_error = stream_err or "فشل التمرير اللحظي."
-                    st.session_state.stage3_stream_bytes = None
-                else:
-                    st.session_state.stage3_stream_error = ""
-                    st.session_state.stage3_stream_bytes = stream_buffer.getvalue()
-                    st.session_state.stage3_stream_filename = f"viral_stream_{video_id}_{start_seconds}_{end_seconds}.mp4"
-                    st.success("✅ تم ضخ البيانات بنجاح. زر التحميل جاهز.")
+                try:
+                    with requests.get(link_or_error, stream=True, timeout=300) as response:
+                        response.raise_for_status()
+                        clip_bytes = b"".join(chunk for chunk in response.iter_content(chunk_size=256 * 1024) if chunk)
+                    if not clip_bytes:
+                        raise ValueError("Cobalt returned empty content")
+                    st.session_state.stage3_api_bytes = clip_bytes
+                    st.session_state.stage3_api_filename = f"viral_cobalt_{video_id}_{start_seconds}_{end_seconds}.mp4"
+                    st.session_state.stage3_api_error = ""
+                    st.success("✅ المقطع جاهز للتحميل داخل الصفحة.")
+                except Exception as exc:
+                    st.session_state.stage3_api_error = f"فشل تنزيل الملف من رابط Cobalt: {exc}"
+                    st.session_state.stage3_api_bytes = None
 
-    if st.session_state.stage3_stream_error:
-        st.error(st.session_state.stage3_stream_error)
+    if st.session_state.stage3_api_error:
+        st.error(st.session_state.stage3_api_error)
 
-    if st.session_state.stage3_stream_bytes:
+    if st.session_state.stage3_api_bytes:
         st.download_button(
             label="⬇️ تنزيل المقطع الآن",
-            data=io.BytesIO(st.session_state.stage3_stream_bytes),
-            file_name=st.session_state.stage3_stream_filename or f"viral_stream_{video_id}.mp4",
+            data=io.BytesIO(st.session_state.stage3_api_bytes),
+            file_name=st.session_state.stage3_api_filename or f"viral_cobalt_{video_id}.mp4",
             mime="video/mp4",
             use_container_width=True,
-            key="stage3_stream_dl",
+            key="stage3_api_dl",
         )
 
     st.caption(
         f"توقيت اللقطة: من {start_seconds}s إلى {end_seconds}s | الجودة المختارة: {selected_quality} | "
-        "يتم السحب عبر stream + identity transfer دون ضغط."
+        "المصدر: Cobalt API ثم تحميل داخل الصفحة."
     )
 
 
